@@ -533,4 +533,22 @@ mod tests {
         assert!(on.iter().all(|e| e.concert_midi == 63));
         assert!(on.iter().all(|e| e.written_midi == 72)); // written C5
     }
+
+    #[test]
+    fn staccato_quarters_have_accurate_onsets() {
+        // 100 bpm: 220 ms of sound, 380 ms of silence, eight times.
+        let mut segs = vec![rest(100.0)];
+        for _ in 0..8 {
+            segs.push(note(65.0, 220.0));
+            segs.push(rest(380.0));
+        }
+        let ev = run(Instrument::AltoSax, &render(&segs));
+        assert_balanced(&ev);
+        let on = ons(&ev);
+        assert_eq!(on.len(), 8, "{ev:#?}");
+        for (i, e) in on.iter().enumerate() {
+            let expected = 100.0 + i as f64 * 600.0;
+            assert!((e.timestamp_ms - expected).abs() < 12.0, "note {i}: {}", e.timestamp_ms);
+        }
+    }
 }
