@@ -5,7 +5,7 @@
 
 import { jsPDF } from "jspdf";
 import { svg2pdf } from "svg2pdf.js";
-import { beatSteps, groupSteps, measureSteps, meterGlyph, meterName, type TimeSignature } from "../meter";
+import { beatSteps, groupSteps, meterGlyph, meterName, type TimeSignature } from "../meter";
 import { renderScore, systemHeight, type StaffInput } from "../render";
 
 export type PageSize = "letter" | "a4";
@@ -53,7 +53,6 @@ export async function toPdf(sections: PdfSection[], o: PdfOptions): Promise<Uint
   const pageW = pdf.internal.pageSize.getWidth();
   const pageH = pdf.internal.pageSize.getHeight();
   const contentW = pageW - MARGIN * 2;
-  const spm = measureSteps(o.timeSig);
   let firstPage = true;
   let pageNo = 0;
   const footers: Array<() => void> = [];
@@ -68,10 +67,22 @@ export async function toPdf(sections: PdfSection[], o: PdfOptions): Promise<Uint
       // Staff size: about 8.5 mm for a part, smaller for a full score.
       const scale = n === 1 ? 0.6 : n <= 3 ? 0.5 : n <= 6 ? 0.42 : 0.36;
       const renderW = contentW / scale;
-      const perRow = n === 1 ? (spm <= 8 ? 5 : spm <= 16 ? 4 : 3) : spm <= 12 ? 4 : 3;
       const sysPt = systemHeight(n) * scale;
       const measureCount = Math.max(1, ...section.staves.map((s) => s.measures.length));
-      const totalRows = Math.ceil(measureCount / perRow);
+      const renderOpts = {
+        width: renderW,
+        timeSig: meterGlyph(o.timeSig),
+        beamGroups: groupSteps(o.timeSig),
+        ink: "#000000",
+        showNames: n > 1,
+      };
+      // Trial layout of the whole section: where the line breaks fall.
+      const trial = renderScore(host, section.staves, renderOpts);
+      const rowStarts: number[] = [];
+      trial.measures.forEach((m, i) => {
+        if (i === 0 || m.system !== trial.measures[i - 1].system) rowStarts.push(i);
+      });
+      const totalRows = rowStarts.length;
 
       let row = 0;
       let sectionPage = 0;
@@ -99,8 +110,8 @@ export async function toPdf(sections: PdfSection[], o: PdfOptions): Promise<Uint
         }
         const room = pageH - MARGIN - FOOTER - top - TOP_PAD_PX * scale;
         const rowsHere = Math.max(1, Math.floor(room / sysPt));
-        const from = row * perRow;
-        const to = Math.min(measureCount, (row + rowsHere) * perRow);
+        const from = rowStarts[row];
+        const to = row + rowsHere < totalRows ? rowStarts[row + rowsHere] : measureCount;
 
         const staves: StaffInput[] = section.staves.map((s) => {
           const pm = from > 0 ? s.measures[from - 1] : undefined;
@@ -108,15 +119,10 @@ export async function toPdf(sections: PdfSection[], o: PdfOptions): Promise<Uint
           return { ...s, measures: s.measures.slice(from, to), tieIn: !!prev?.tieToNext, isSelected: undefined };
         });
         const layout = renderScore(host, staves, {
-          width: renderW,
-          timeSig: meterGlyph(o.timeSig),
-          beamGroups: groupSteps(o.timeSig),
-          ink: "#000000",
-          measuresPerRow: perRow,
+          ...renderOpts,
           showTimeSig: sectionPage === 0,
           firstMeasureNumber: from + 1,
           finalBarline: to >= measureCount,
-          showNames: n > 1,
         });
         const svg = host.querySelector("svg");
         // svg2pdf ignores "pt" font sizes and unknown families: use px and a PDF base font.

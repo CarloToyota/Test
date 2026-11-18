@@ -9,6 +9,8 @@ import type { CaptureInfo, EngineStatus, InputDevice, InstrumentId, InstrumentIn
 export interface EngineHandlers {
   onNote: (e: NoteEvent) => void;
   onStatus: (s: EngineStatus) => void;
+  /** After a take: samples lost because the engine fell behind, and driver glitches. */
+  onStopped?: (s: { droppedSamples: number; xruns: number }) => void;
 }
 
 export interface EngineBridge {
@@ -42,12 +44,14 @@ class TauriBridge implements EngineBridge {
   setInstrument(instrument: InstrumentId) {
     return invoke<void>("set_instrument", { instrument });
   }
-  async subscribe({ onNote, onStatus }: EngineHandlers) {
+  async subscribe({ onNote, onStatus, onStopped }: EngineHandlers) {
     const offNote = await listen<NoteEvent>("note-event", (e) => onNote(e.payload));
     const offStatus = await listen<EngineStatus>("engine-status", (e) => onStatus(e.payload));
+    const offStopped = await listen<{ droppedSamples: number; xruns: number }>("engine-stopped", (e) => onStopped?.(e.payload));
     return () => {
       offNote();
       offStatus();
+      offStopped();
     };
   }
 }

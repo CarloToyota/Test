@@ -1,0 +1,10 @@
+# Keep text files LF in the repository on every platform (silences the
+# "LF will be replaced by CRLF" warnings on Windows), and never touch binaries.
+* text=auto eol=lf
+*.wav binary
+*.mxl binary
+*.mid binary
+*.png binary
+*.ico binary
+*.icns binary
+*.pdf binary

@@ -16,7 +16,13 @@ Each folder here is one take saved with **Export → Save test case** in the app
 
 ## Running
 
-Re-run the current engine on every recording:
+`cargo test` (in `src-tauri`) runs the current engine on every `recording.wav` and checks the notes against `expected.txt`:
+
+```bash
+cd src-tauri && cargo test --test recordings -- --nocapture
+```
+
+`npm test` checks the notation (rhythm, ties, bars) from `replayed.json`. To refresh `replayed.json` after an engine change:
 
 ```bash
 for d in test-cases/*/; do
@@ -25,10 +31,21 @@ for d in test-cases/*/; do
 done
 ```
 
-Then notate and compare against `expected.txt`:
+To accept the current reading as the new `expected.txt` (review the diff first):
 
 ```bash
-npm test
+WRITE_EXPECTED=1 npx vitest run src/lib/testcases.test.ts
 ```
 
-A case without `expected.txt` prints what the app writes, so it can be checked by eye.
+`session.json` may contain `"notateAs": "3/4"` when a piece was recorded with a different click meter.
+
+## Cases so far
+
+| Case | What was played | Result |
+|---|---|---|
+| `21-15-27` | Alto, written C5: 4 quarters, 8 eighths, 16 sixteenths (dragged), 80 bpm | Exact; the dragged 16ths are written as played |
+| `21-19-08` | Alto, G4 to G5 and back in quarters, whole note at the end, 80 bpm | Exact |
+| `21-28-12` | Alto, The Star-Spangled Banner, 3/4 at 80 bpm (recorded with a 4/4 click); `.mxl` is the score | Every pitch right. 80 of 101 notes have exactly the score's start and length; the rest are expressive timing (rubato) |
+| `21-32-08` | Alto, 16ths, four per scale step from D4 to C6, 80 bpm | Exact apart from one extra D5 |
+
+`src/lib/rhythmeval.test.ts` scores rhythm settings against the anthem's score: `EVAL=1 npx vitest run src/lib/rhythmeval.test.ts`.

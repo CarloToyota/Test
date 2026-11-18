@@ -34,6 +34,11 @@ tauri-plugin-dialog = "2.4"
 # The DSP must run at full speed even in `tauri dev`, or it falls behind real time.
 opt-level = 3
 
+[profile.dev.package.band-transcriber]
+# Our own crate too: the pitch analysis is ~20x slower unoptimized, which in a debug
+# build is enough to fall behind the microphone.
+opt-level = 3
+
 [profile.release]
 codegen-units = 1
 lto = true

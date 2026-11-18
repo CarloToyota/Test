@@ -38,8 +38,18 @@ describe("quantizeNotes", () => {
     expect(q.map((x) => [x.s, x.e])).toEqual([[0, 4], [8, 12]]);
   });
   it("snaps to a coarser grid", () => {
-    const q = quantizeNotes([n(60, 260, 740)], { ...opts, resolution: "8th" });
-    expect(q.map((x) => [x.s, x.e])).toEqual([[2, 6]]);
+    // Starts on the "and" of 1 (8th grid); the note is then held to the beat.
+    const q = quantizeNotes([n(60, 260, 740), n(62, 1000, 1400)], { ...opts, resolution: "8th" });
+    expect(q.map((x) => [x.s, x.e])).toEqual([[2, 8], [8, 12]]);
+  });
+
+  it("breaths in long notes are not rests; a full beat of silence is", () => {
+    // A half note released early (a breath), then a note on beat 3.
+    const breath = quantizeNotes([n(60, 0, 620), n(62, 1000, 1450)], opts);
+    expect(breath.map((x) => [x.s, x.e])).toEqual([[0, 8], [8, 12]]);
+    // A quarter, then a full beat of silence before the next note.
+    const rest = quantizeNotes([n(60, 0, 450), n(62, 1000, 1450)], opts);
+    expect(rest.map((x) => [x.s, x.e])).toEqual([[0, 4], [8, 12]]);
   });
 });
 
@@ -75,6 +85,16 @@ describe("buildScore", () => {
     const notes = [n(60, 0, 1500)];
     const [bar] = buildScore(notes, 1500, { ...opts, timeSig: { num: 3, den: 4 } });
     expect(bar.items.map((i) => [i.duration, i.dots])).toEqual([["h", 1]]);
+  });
+});
+
+describe("fast passages", () => {
+  it("16ths played a little early on the 'e' stay 16ths (no snapping onto the beat)", () => {
+    // 80 bpm: 16th = 187.5 ms. Each 'e' and 'a' about a third of a 16th early.
+    const t = [0, 0.7, 2, 2.7, 4, 4.7, 6, 6.7].map((x) => x * 187.5);
+    const notes = t.map((s, i) => n(60 + (i >> 2), s, s + 150));
+    const q = quantizeNotes(notes, { ...opts, bpm: 80 });
+    expect(q.map((x) => x.s)).toEqual([0, 1, 2, 3, 4, 5, 6, 7]);
   });
 });
 

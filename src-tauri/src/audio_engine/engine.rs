@@ -27,7 +27,7 @@ pub struct EngineConfig {
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
-            peak_pick_k: 0.90,
+            peak_pick_k: 0.97,
             min_clarity: 0.85,
             gate_db: -55.0,
             hop: 256,

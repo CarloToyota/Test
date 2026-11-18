@@ -38,6 +38,22 @@ pub struct TrackerConfig {
     pub onset_decide_ms: f32,
     /// Per-frame rate at which the vibrato centre follows the player's intonation.
     pub center_adapt: f32,
+    /// Per-frame rate at which the reference pitch follows the player's overall tuning
+    /// (an instrument tuned flat reads as in tune), and the most it may move, in semitones.
+    pub tuning_adapt: f32,
+    pub max_tuning: f32,
+    /// Mean sub-octave energy (dB, see `PitchFrame::sub_octave_db`) over a candidate's
+    /// frames above which the note is taken to sound an octave lower (missing
+    /// fundamental). Measured on recorded alto sax: such notes average about -22 dB,
+    /// correctly read notes about -49 dB (99% of frames below -25 dB).
+    pub sub_octave_db: f32,
+    /// The octave check skips this much of each note's attack, then averages over
+    /// `octave_check_ms` of steady pitch.
+    pub octave_settle_ms: f32,
+    pub octave_check_ms: f32,
+    /// Pitch frames this far below the note's peak level (inside a tongue stop or a
+    /// fading tail) are unreliable: they neither change the note nor set its octave.
+    pub dip_db: f32,
 }
 
 impl Default for TrackerConfig {
@@ -56,6 +72,12 @@ impl Default for TrackerConfig {
             onset_link_ms: 70.0,
             onset_decide_ms: 8.0,
             center_adapt: 0.04,
+            tuning_adapt: 0.01,
+            max_tuning: 0.45,
+            sub_octave_db: -25.0,
+            octave_settle_ms: 40.0,
+            octave_check_ms: 50.0,
+            dip_db: 12.0,
         }
     }
 }
@@ -84,6 +106,8 @@ struct Candidate {
     frames: u32,
     first_ms: f64,
     midi_sum: f32,
+    /// Sum of sub-octave energy in linear power ratio, for the mean.
+    sub_sum: f32,
 }
 
 impl Candidate {
@@ -93,7 +117,13 @@ impl Candidate {
             frames: 1,
             first_ms: time_ms,
             midi_sum: p.midi,
+            sub_sum: db_to_power(p.sub_octave_db),
         }
+    }
+
+    /// Mean sub-octave energy over the candidate's frames, in dB.
+    fn sub_db(&self) -> f32 {
+        10.0 * (self.sub_sum / self.frames as f32).max(1e-20).log10()
     }
 
     fn mean(&self) -> f32 {
@@ -103,6 +133,7 @@ impl Candidate {
     fn push(&mut self, p: &PitchFrame) {
         self.frames += 1;
         self.midi_sum += p.midi;
+        self.sub_sum += db_to_power(p.sub_octave_db);
     }
 }
 
@@ -121,6 +152,12 @@ struct Active {
     /// A tonguing onset that turned out to start a *different* pitch; it gives the
     /// time and articulation of the change once the candidate is confirmed.
     change_onset_ms: Option<f64>,
+    articulation: Articulation,
+    /// Missing-fundamental check: steady frames seen, their summed sub-octave power,
+    /// and whether the note's octave has been settled.
+    octave_frames: u32,
+    octave_sub: f32,
+    octave_checked: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -137,8 +174,19 @@ pub struct NoteTracker {
     octave_frames: u32,
     release_frames: u32,
     hold_frames: u32,
+    octave_check_frames: u32,
     state: State,
     pending_onset_ms: Option<f64>,
+    /// Learned tuning offset in semitones (negative = player is flat of A440).
+    tuning: f32,
+}
+
+fn db_to_power(db: f32) -> f32 {
+    if db.is_finite() {
+        10f32.powf(db / 10.0)
+    } else {
+        0.0
+    }
 }
 
 fn frames_for(ms: f32, hop_ms: f64) -> u32 {
@@ -161,11 +209,23 @@ impl NoteTracker {
             octave_frames: frames_for(cfg.octave_change_ms, hop_ms),
             release_frames: frames_for(cfg.release_ms, hop_ms),
             hold_frames: frames_for(cfg.hold_unclear_ms, hop_ms),
+            octave_check_frames: frames_for(cfg.octave_check_ms, hop_ms),
             cfg,
             hop_ms,
             state: State::Idle { candidate: None },
             pending_onset_ms: None,
+            tuning: 0.0,
         }
+    }
+
+    /// The learned tuning offset in cents (negative = flat of A440).
+    pub fn tuning_cents(&self) -> f32 {
+        self.tuning * 100.0
+    }
+
+    /// Nearest semitone to a fractional MIDI pitch, relative to the learned tuning.
+    fn nearest(&self, midi: f32) -> u8 {
+        (midi - self.tuning).round().clamp(0.0, 127.0) as u8
     }
 
     pub fn reset(&mut self) {
@@ -235,6 +295,7 @@ impl NoteTracker {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn start_note(
         &mut self,
         midi: u8,
@@ -243,6 +304,7 @@ impl NoteTracker {
         now_ms: f64,
         p: PitchFrame,
         level_db: f32,
+        articulation: Articulation,
     ) {
         self.state = State::Active(Active {
             midi,
@@ -254,6 +316,10 @@ impl NoteTracker {
             last: p,
             candidate: None,
             change_onset_ms: None,
+            articulation,
+            octave_frames: 0,
+            octave_sub: 0.0,
+            octave_checked: false,
         });
     }
 
@@ -269,7 +335,7 @@ impl NoteTracker {
             self.state = State::Idle { candidate: None };
             return;
         };
-        let rounded = p.midi.round().clamp(0.0, 127.0) as u8;
+        let rounded = self.nearest(p.midi);
         let cand = match candidate {
             // Up to half a semitone of drift while the attack settles.
             Some(mut c) if (p.midi - c.mean()).abs() <= 0.5 => {
@@ -285,14 +351,14 @@ impl NoteTracker {
         }
 
         let center = cand.mean();
-        let midi = center.round().clamp(0.0, 127.0) as u8;
+        let midi = self.nearest(center);
         let link = self.cfg.onset_link_ms as f64;
         let start_ms = match self.pending_onset_ms.take() {
             Some(t) if (t - cand.first_ms).abs() <= link => t,
             _ => cand.first_ms,
         };
         out.push(Self::event(TrackerEventKind::On, Articulation::Attack, midi, start_ms, &p));
-        self.start_note(midi, center, start_ms, time_ms, p, level_db);
+        self.start_note(midi, center, start_ms, time_ms, p, level_db, Articulation::Attack);
     }
 
     fn process_active(
@@ -321,7 +387,10 @@ impl NoteTracker {
         a.missing = 0;
         a.peak_db = a.peak_db.max(level_db);
         a.last_pitched_ms = time_ms;
-        a.last = p;
+        let weak = level_db < a.peak_db - self.cfg.dip_db;
+        if !weak {
+            a.last = p;
+        }
         let dev_cents = (p.midi - a.center) * 100.0;
 
         // Tonguing: an amplitude onset while the note sounds. Wait until the pitch window
@@ -337,7 +406,7 @@ impl NoteTracker {
                     out.push(Self::event(TrackerEventKind::Off, Articulation::Tongued, a.midi, t, &p));
                     out.push(Self::event(TrackerEventKind::On, Articulation::Tongued, a.midi, t, &p));
                     let (midi, center) = (a.midi, a.center);
-                    self.start_note(midi, center, t, time_ms, p, level_db);
+                    self.start_note(midi, center, t, time_ms, p, level_db, Articulation::Tongued);
                     return;
                 }
                 // A tongued attack on a different pitch: let the change logic below
@@ -346,16 +415,56 @@ impl NoteTracker {
             }
         }
 
-        if dev_cents.abs() <= self.cfg.vibrato_cents {
-            // Inside the vibrato band: the same note. Follow slow intonation drift.
+        if weak {
+            // A tongue stop or a fading tail: keep the note as it is.
             a.candidate = None;
-            a.center += self.cfg.center_adapt * (p.midi - a.center);
             self.state = State::Active(a);
             return;
         }
 
-        let rounded = p.midi.round().clamp(0.0, 127.0) as u8;
-        if rounded == a.midi || (p.midi - rounded as f32).abs() * 100.0 > self.cfg.snap_cents {
+        if dev_cents.abs() <= self.cfg.vibrato_cents {
+            // Inside the vibrato band: the same note. Follow slow intonation drift.
+            if let Some(t) = a.change_onset_ms.take() {
+                // A tongued attack whose first frames misread the pitch, now settled on
+                // the same note: it is a repeated note, dated at the attack.
+                out.push(Self::event(TrackerEventKind::Off, Articulation::Tongued, a.midi, t, &p));
+                out.push(Self::event(TrackerEventKind::On, Articulation::Tongued, a.midi, t, &p));
+                let (midi, center, checked) = (a.midi, a.center, a.octave_checked);
+                self.start_note(midi, center, t, time_ms, p, level_db, Articulation::Tongued);
+                if let State::Active(n) = &mut self.state {
+                    n.octave_checked = checked;
+                }
+                return;
+            }
+            a.candidate = None;
+            a.center += self.cfg.center_adapt * (p.midi - a.center);
+            // Learn the player's tuning from steady, in-band pitch.
+            let off = p.midi - a.midi as f32;
+            self.tuning = (self.tuning + self.cfg.tuning_adapt * (off - self.tuning))
+                .clamp(-self.cfg.max_tuning, self.cfg.max_tuning);
+            // Once per note, after the attack: is this a missing fundamental (the note
+            // really sounds an octave lower)? If so, re-pitch it from its start.
+            let steady = level_db >= a.peak_db - 6.0 && p.clarity >= 0.97;
+            if !a.octave_checked && steady && time_ms - a.start_ms >= self.cfg.octave_settle_ms as f64 {
+                a.octave_frames += 1;
+                a.octave_sub += db_to_power(p.sub_octave_db);
+                if a.octave_frames >= self.octave_check_frames {
+                    a.octave_checked = true;
+                    let mean_db = 10.0 * (a.octave_sub / a.octave_frames as f32).max(1e-20).log10();
+                    if mean_db > self.cfg.sub_octave_db && a.midi >= 12 {
+                        out.push(Self::event(TrackerEventKind::Off, a.articulation, a.midi, a.start_ms, &p));
+                        a.midi -= 12;
+                        a.center -= 12.0;
+                        out.push(Self::event(TrackerEventKind::On, a.articulation, a.midi, a.start_ms, &p));
+                    }
+                }
+            }
+            self.state = State::Active(a);
+            return;
+        }
+
+        let rounded = self.nearest(p.midi);
+        if rounded == a.midi || (p.midi - self.tuning - rounded as f32).abs() * 100.0 > self.cfg.snap_cents {
             // Either a wide excursion that still rounds to this note, or a pitch between
             // semitones (the crest of a wide vibrato, or a glide). Neither is a new note.
             a.candidate = None;
@@ -370,10 +479,12 @@ impl NoteTracker {
             }
             _ => Candidate::new(rounded, &p, time_ms),
         };
-        let required = if a.change_onset_ms.is_some() {
-            self.note_on_frames
-        } else if is_overblow_interval(rounded, a.midi) {
+        // Octave-type jumps always need the long confirmation, even right after a
+        // tongued attack: the first frames of an attack are where octave misreads live.
+        let required = if is_overblow_interval(rounded, a.midi) {
             self.octave_frames
+        } else if a.change_onset_ms.is_some() {
+            self.note_on_frames
         } else {
             self.change_frames
         };
@@ -384,14 +495,35 @@ impl NoteTracker {
             return;
         }
 
+        // A reading an octave above the sounding note, with energy left at the note's
+        // own pitch, is the same note's missing fundamental flickering, not a new note.
+        let target = cand.midi;
+        let center = cand.mean();
+        if target == a.midi + 12 && cand.sub_db() > self.cfg.sub_octave_db {
+            // Only the octave reading flickered; it is the same note.
+            if let Some(t) = a.change_onset_ms.take() {
+                // ...re-tongued.
+                out.push(Self::event(TrackerEventKind::Off, Articulation::Tongued, a.midi, t, &p));
+                out.push(Self::event(TrackerEventKind::On, Articulation::Tongued, a.midi, t, &p));
+                let (midi, keep, checked) = (a.midi, a.center, a.octave_checked);
+                self.start_note(midi, keep, t.max(a.start_ms), time_ms, p, level_db, Articulation::Tongued);
+                if let State::Active(n) = &mut self.state {
+                    n.octave_checked = checked;
+                }
+            } else {
+                a.candidate = None;
+                self.state = State::Active(a);
+            }
+            return;
+        }
+
         let (t, art) = match a.change_onset_ms.take() {
             Some(t) => (t, Articulation::Tongued),
             None => (cand.first_ms, Articulation::Legato),
         };
         let t = t.max(a.start_ms);
         out.push(Self::event(TrackerEventKind::Off, art, a.midi, t, &p));
-        out.push(Self::event(TrackerEventKind::On, art, cand.midi, t, &p));
-        let center = cand.mean();
-        self.start_note(rounded, center, t, time_ms, p, level_db);
+        out.push(Self::event(TrackerEventKind::On, art, target, t, &p));
+        self.start_note(target, center, t, time_ms, p, level_db, art);
     }
 }

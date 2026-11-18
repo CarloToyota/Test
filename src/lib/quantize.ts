@@ -79,21 +79,32 @@ export function stepMs(bpm: number, ts: TimeSignature): number {
 // 3. Durations run to the next attack. A note shorter than a beat is written up to the
 //    next beat (or the next note, if sooner); a rest appears only for real silence.
 
-/** Snap tolerance for the beat level, as a fraction of the beat. */
-const BEAT_SNAP = 0.18;
-/** Snap tolerance for subdivision levels, as a fraction of the level. */
-const SUB_SNAP = 0.24;
-/** Largest steady timing offset the alignment corrects, in steps. */
-const MAX_ALIGN = 0.8;
-/** Neighbouring onsets on each side used to estimate the local offset. */
-const ALIGN_WINDOW = 6;
+/** Rhythm-reading parameters (tuned on recorded playing; tests may adjust them). */
+export const RHYTHM = {
+  /** Snap tolerance for the beat level, as a fraction of the beat. */
+  beatSnap: 0.18,
+  /** Snap tolerance for subdivision levels, as a fraction of the level. */
+  subSnap: 0.24,
+  /** Largest steady timing offset the alignment corrects, in steps. */
+  maxAlign: 0.8,
+  /** Neighbouring onsets on each side used to estimate the local offset. */
+  alignWindow: 6,
+  /** Cost per step of offset per onset: how much evidence a correction needs. */
+  alignPenalty: 0.06,
+  /** Hold notes of any length to the next beat (not only notes shorter than a beat). */
+  holdToBeat: true,
+  /** A note may snap at most this fraction of the gap to its nearest neighbouring attack. */
+  densityTol: 0.45,
+};
 
-/** Snap a position (steps) to the simplest metric level that explains it. */
-export function snapSteps(t: number, levels: number[]): number {
+/** Snap a position (steps) to the simplest metric level that explains it. `maxTol`
+ *  caps how far a note may move: in a run of fast notes a coarse level must not pull
+ *  a note onto its neighbour's slot. */
+export function snapSteps(t: number, levels: number[], maxTol = Number.POSITIVE_INFINITY): number {
   for (let i = 0; i < levels.length - 1; i++) {
     const l = levels[i];
     const nearest = Math.round(t / l) * l;
-    const tol = i === 0 && l >= 4 ? BEAT_SNAP * l : SUB_SNAP * l;
+    const tol = Math.min(maxTol, i === 0 && l >= 4 ? RHYTHM.beatSnap * l : RHYTHM.subSnap * l);
     if (Math.abs(t - nearest) <= tol) return nearest;
   }
   const f = levels[levels.length - 1];
@@ -109,8 +120,8 @@ export function estimateOffset(onsetSteps: number[]): number {
   let best = 0;
   let bestCost = Number.POSITIVE_INFINITY;
   for (let k = -n; k <= n; k++) {
-    const d = (k / n) * MAX_ALIGN;
-    let cost = onsetSteps.length * 0.02 * Math.abs(d);
+    const d = (k / n) * RHYTHM.maxAlign;
+    let cost = onsetSteps.length * RHYTHM.alignPenalty * Math.abs(d);
     for (const t of onsetSteps) {
       const x = (t - d) / 2;
       cost += Math.min(Math.abs(x - Math.round(x)) * 2, 0.5);
@@ -123,6 +134,33 @@ export function estimateOffset(onsetSteps: number[]): number {
   return best;
 }
 
+/** Notes shorter than this that touch a neighbour are attack transients (the pitch
+ *  settling as the note speaks, a tongue blip), not notes: they join the neighbour. */
+const BLIP_MS = 60;
+/** "Touching": no more silence than this between them. */
+const TOUCH_MS = 20;
+
+/** Fold transient blips into the note they belong to; drop isolated glitches. */
+export function mergeBlips(notes: TimedNote[]): TimedNote[] {
+  const out = notes.map((n) => ({ ...n })).sort((a, b) => a.startMs - b.startMs);
+  for (let i = 0; i < out.length; i++) {
+    const n = out[i];
+    if (n.live || n.endMs - n.startMs >= BLIP_MS) continue;
+    const next = out[i + 1];
+    const prev = out[i - 1];
+    if (next && next.startMs - n.endMs <= TOUCH_MS) {
+      next.startMs = n.startMs; // the blip was the start of the next note
+    } else if (prev && n.startMs - prev.endMs <= TOUCH_MS) {
+      prev.endMs = Math.max(prev.endMs, n.endMs); // the tail of the previous note
+    } else if (n.endMs - n.startMs >= MIN_NOTE_MS) {
+      continue; // a short but separate note
+    }
+    out.splice(i, 1);
+    i--;
+  }
+  return out;
+}
+
 /** Interpret timed notes as notated rhythm (the engine is monophonic). */
 export function quantizeNotes(notes: TimedNote[], opts: QuantizeOptions): QNote[] {
   const ts = opts.timeSig;
@@ -130,27 +168,44 @@ export function quantizeNotes(notes: TimedNote[], opts: QuantizeOptions): QNote[
   const finest = resolutionSteps(opts.resolution, ts);
   const levels = gridLevels(ts, finest);
   const step = stepMs(opts.bpm, ts);
-  const sorted = notes
-    .filter((n) => n.live || n.endMs - n.startMs >= MIN_NOTE_MS)
-    .sort((a, b) => a.startMs - b.startMs);
+  const sorted = mergeBlips(notes);
   const onsets = sorted.map((n) => n.startMs / step);
   const offsets = onsets.map((_, i) =>
-    estimateOffset(onsets.slice(Math.max(0, i - ALIGN_WINDOW), i + ALIGN_WINDOW + 1)),
+    estimateOffset(onsets.slice(Math.max(0, i - RHYTHM.alignWindow), i + RHYTHM.alignWindow + 1)),
   );
-  const starts = onsets.map((t, i) => snapSteps(t - offsets[i], levels));
+  // A steady lean changes slowly: smooth each note's estimate with its neighbours'
+  // (a median, so one ambiguous window can't flip a note).
+  const smooth = offsets.map((_, i) => {
+    const w = offsets.slice(Math.max(0, i - 2), i + 3).sort((a, b) => a - b);
+    return w[Math.floor(w.length / 2)];
+  });
+  const aligned = onsets.map((t, i) => t - smooth[i]);
+  const starts = aligned.map((t, i) => {
+    const gap = Math.min(
+      i > 0 ? t - aligned[i - 1] : Number.POSITIVE_INFINITY,
+      i + 1 < aligned.length ? aligned[i + 1] - t : Number.POSITIVE_INFINITY,
+    );
+    return snapSteps(t, levels, RHYTHM.densityTol * gap);
+  });
+  // A later attack never shares or precedes its predecessor's slot.
+  for (let i = 1; i < starts.length; i++) {
+    if (starts[i] <= starts[i - 1] && onsets[i] - onsets[i - 1] >= 0.5 * finest) starts[i] = starts[i - 1] + finest;
+  }
 
   const q: QNote[] = [];
   sorted.forEach((n, i) => {
     let s = starts[i];
-    const end = n.endMs / step - offsets[i];
+    const end = n.endMs / step - smooth[i];
     let e: number;
     if (n.live) {
       e = Math.round(end / finest) * finest;
     } else {
       const next = i + 1 < starts.length ? starts[i + 1] : Number.POSITIVE_INFINITY;
       const sounded = Math.max(snapSteps(end, levels), s + finest);
-      // Shorter than a beat: articulation, so hold it to the next beat or next attack.
-      const written = sounded - s < beat ? Math.ceil(sounded / beat) * beat : sounded;
+      // Players lift before a note's written end (staccato, breaths). Hold the note to
+      // the next beat (or the next attack, if sooner); only silence that covers a
+      // whole beat is written as a rest.
+      const written = RHYTHM.holdToBeat || sounded - s < beat ? Math.ceil(sounded / beat) * beat : sounded;
       e = Math.min(written, next);
     }
     if (e <= s) e = s + finest;

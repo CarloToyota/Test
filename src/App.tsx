@@ -233,7 +233,12 @@ export default function App() {
   useEffect(() => {
     let unlisten: (() => void) | null = null;
     let cancelled = false;
-    engine.subscribe({ onNote: handleNote, onStatus: handleStatus }).then((off) => {
+    const onStopped = ({ droppedSamples }: { droppedSamples: number; xruns: number }) => {
+      if (droppedSamples > 0) {
+        setNotice(`The computer couldn't keep up with the microphone: ${droppedSamples} samples were lost, so a few notes may be missing. Closing other apps usually helps.`);
+      }
+    };
+    engine.subscribe({ onNote: handleNote, onStatus: handleStatus, onStopped }).then((off) => {
       if (cancelled) off();
       else unlisten = off;
     });

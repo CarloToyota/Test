@@ -23,6 +23,10 @@ pub struct OnsetConfig {
     pub refractory_ms: f32,
     /// Onsets below this absolute level are ignored, dBFS.
     pub gate_db: f32,
+    /// After an onset, the level must fall this far below its peak before another
+    /// onset can fire. A real re-articulation always has a dip (the tongue stops the
+    /// reed); a slow brass or sax attack that keeps rising does not.
+    pub rearm_db: f32,
 }
 
 impl Default for OnsetConfig {
@@ -32,6 +36,7 @@ impl Default for OnsetConfig {
             lookback_ms: 45.0,
             refractory_ms: 60.0,
             gate_db: -50.0,
+            rearm_db: 4.0,
         }
     }
 }
@@ -49,6 +54,8 @@ pub struct OnsetDetector {
     refractory_blocks: usize,
     blocks_since_onset: usize,
     prev_db: f32,
+    armed: bool,
+    peak_since_onset: f32,
 }
 
 const FLOOR_DB: f32 = -120.0;
@@ -65,6 +72,8 @@ impl OnsetDetector {
             refractory_blocks,
             blocks_since_onset: usize::MAX / 2,
             prev_db: FLOOR_DB,
+            armed: true,
+            peak_since_onset: FLOOR_DB,
         }
     }
 
@@ -72,6 +81,8 @@ impl OnsetDetector {
         self.history.clear();
         self.blocks_since_onset = usize::MAX / 2;
         self.prev_db = FLOOR_DB;
+        self.armed = true;
+        self.peak_since_onset = FLOOR_DB;
     }
 
     /// Feed one hop. `level_window` holds the most recent filtered samples over which
@@ -86,7 +97,15 @@ impl OnsetDetector {
         let rising = level_db > self.prev_db;
         self.blocks_since_onset = self.blocks_since_onset.saturating_add(1);
 
-        let onset = recent_min.is_finite()
+        self.peak_since_onset = self.peak_since_onset.max(level_db);
+        if !self.armed
+            && (level_db <= self.peak_since_onset - self.config.rearm_db || level_db < self.config.gate_db)
+        {
+            self.armed = true;
+        }
+
+        let onset = self.armed
+            && recent_min.is_finite()
             && level_db >= self.config.gate_db
             && rising
             && level_db - recent_min >= self.config.rise_db
@@ -94,6 +113,8 @@ impl OnsetDetector {
 
         if onset {
             self.blocks_since_onset = 0;
+            self.armed = false;
+            self.peak_since_onset = level_db;
         }
 
         self.history.push_back(level_db);

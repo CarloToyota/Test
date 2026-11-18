@@ -40,7 +40,6 @@ export interface RenderOptions {
   ink: string;
   liveColor?: string;
   selectColor?: string;
-  measuresPerRow?: number;
   showTimeSig?: boolean;
   firstMeasureNumber?: number;
   finalBarline?: boolean;
@@ -69,16 +68,11 @@ const TOP_PAD = 24;
 const SIDE_PAD = 12;
 const STAFF_SPACING = 105;
 const SYSTEM_GAP = 30;
-const MIN_MEASURE_WIDTH = 230;
 const NAME_WIDTH = 96;
 const SHORT_NAME_WIDTH = 54;
 
 export function systemHeight(staves: number): number {
   return staves <= 1 ? 130 : staves * STAFF_SPACING + SYSTEM_GAP;
-}
-
-export function measuresPerRowFor(width: number): number {
-  return Math.max(1, Math.min(6, Math.floor((width - SIDE_PAD * 2) / MIN_MEASURE_WIDTH)));
 }
 
 /** Beam runs of two or more 8ths/16ths that sit within one beam group. */
@@ -112,22 +106,47 @@ function beamNotes(items: ScoreItem[], notes: StaveNote[], groups: number[]): Be
   return beams;
 }
 
+/** A bar's notes, built and measured before layout. */
+interface BuiltBar {
+  pending: Array<{ si: number; voice: Voice; notes: StaveNote[]; items: ScoreItem[]; beams: Beam[] }>;
+  voices: Voice[];
+  formatter: Formatter | null;
+  /** Width the notes need (VexFlow's minimum, plus breathing room), px. */
+  need: number;
+}
+
+/** Room a bar needs for its notes, generous enough that nothing collides. */
+const NOTE_SPACE = 1.35;
+const BAR_PADDING = 34;
+const EMPTY_BAR = 90;
+const MAX_BARS_PER_ROW = 8;
+
+/** Pack bars into systems so each gets the room its notes need. Returns the bar
+ *  indexes of each system. Exported for PDF pagination. */
+export function planRows(needs: number[], width: number, firstExtra: number, rowExtra: number, indentFirst: number, indent: number): number[][] {
+  const rows: number[][] = [];
+  let row: number[] = [];
+  let used = 0;
+  needs.forEach((need, i) => {
+    const room = width - SIDE_PAD * 2 - (rows.length === 0 ? indentFirst : indent) - (rows.length === 0 ? firstExtra : rowExtra);
+    if (row.length > 0 && (used + need > room || row.length >= MAX_BARS_PER_ROW)) {
+      rows.push(row);
+      row = [];
+      used = 0;
+    }
+    row.push(i);
+    used += need;
+  });
+  if (row.length) rows.push(row);
+  return rows;
+}
+
 /** Draws into `host` (its contents are replaced). */
 export function renderScore(host: HTMLElement, staves: StaffInput[], o: RenderOptions): ScoreLayout {
   host.innerHTML = "";
   const nStaves = Math.max(1, staves.length);
   const measureCount = Math.max(1, ...staves.map((s) => s.measures.length));
-  const perRow = o.measuresPerRow ?? measuresPerRowFor(o.width);
-  const rows = Math.ceil(measureCount / perRow);
-  const sysH = systemHeight(nStaves);
-  const height = TOP_PAD + rows * sysH;
   const showNames = o.showNames ?? nStaves > 1;
-
-  const renderer = new Renderer(host as HTMLDivElement, Renderer.Backends.SVG);
-  renderer.resize(o.width, height);
-  const ctx = renderer.getContext();
-  ctx.setFillStyle(o.ink);
-  ctx.setStrokeStyle(o.ink);
 
   const ink = { fillStyle: o.ink, strokeStyle: o.ink };
   const live = { fillStyle: o.liveColor ?? o.ink, strokeStyle: o.liveColor ?? o.ink };
@@ -135,26 +154,103 @@ export function renderScore(host: HTMLElement, staves: StaffInput[], o: RenderOp
   const showTimeSig = o.showTimeSig ?? true;
   const firstNumber = o.firstMeasureNumber ?? 1;
   const maxKeyAcc = Math.max(0, ...staves.map((s) => keyAccidentalCount(s.keySignature)));
-  const keyExtra = 26 + maxKeyAcc * 11;
+  // Clef + key signature at the start of every system, plus the time signature at the start.
+  const rowExtra = 40 + maxKeyAcc * 11;
+  const firstExtra = rowExtra + (showTimeSig ? 30 : 0);
   const [num, den] = o.timeSig.split("/").map(Number);
 
-  const drawn: Array<Array<{ note: StaveNote; item: ScoreItem; row: number }>> = staves.map(() => []);
-  const layout: ScoreLayout = { height, systems: [], measures: [] };
-
+  // 1. Build every bar's notes and measure the room they need.
+  const drawnItems: Array<Array<{ note: StaveNote; item: ScoreItem; bar: number }>> = staves.map(() => []);
+  const built: BuiltBar[] = [];
   for (let index = 0; index < measureCount; index++) {
-    const row = Math.floor(index / perRow);
-    const col = index % perRow;
-    const isFirstInRow = col === 0;
-    const isFirst = index === 0;
-    const indent = showNames ? (row === 0 ? NAME_WIDTH : SHORT_NAME_WIDTH) : 0;
-    const usable = o.width - SIDE_PAD * 2 - indent;
-    const extraFirst = keyExtra + (isFirst && showTimeSig ? 30 : 0);
-    const baseWidth = (usable - extraFirst) / perRow;
-    const x = SIDE_PAD + indent + (isFirstInRow ? 0 : extraFirst + baseWidth * col);
-    const w = baseWidth + (isFirstInRow ? extraFirst : 0);
-    const top = TOP_PAD + row * sysH;
-    if (isFirstInRow) layout.systems.push({ top: top + 10, bottom: top + (nStaves - 1) * STAFF_SPACING + 90 });
+    const voices: Voice[] = [];
+    const pending: BuiltBar["pending"] = [];
+    staves.forEach((s, si) => {
+      const measure = s.measures[index];
+      if (!measure || measure.items.length === 0) return;
+      const restKey = s.clef === "bass" ? "d/3" : "b/4";
+      const notes = measure.items.map((item) => {
+        const note = new StaveNote({
+          clef: s.clef,
+          keys: [item.kind === "rest" ? restKey : vexKey(item.midi, s.keySignature)],
+          duration: item.duration + (item.kind === "rest" ? "r" : ""),
+          dots: item.dots,
+          align_center: item.measureRest,
+        });
+        if (item.dots) Dot.buildAndAttach([note], { all: true });
+        note.setStyle(s.isSelected?.(item) ? selected : item.live ? live : ink);
+        drawnItems[si].push({ note, item, bar: index });
+        return note;
+      });
+      const voice = new Voice({ num_beats: num, beat_value: den }).setMode(Voice.Mode.SOFT);
+      voice.addTickables(notes);
+      Accidental.applyAccidentals([voice], s.keySignature);
+      notes.forEach((n) => n.getModifiers().forEach((m) => m.setStyle(n.getStyle() ?? ink)));
+      const beams = beamNotes(measure.items, notes, o.beamGroups);
+      voices.push(voice);
+      pending.push({ si, voice, notes, items: measure.items, beams });
+    });
+    let formatter: Formatter | null = null;
+    let need = EMPTY_BAR;
+    if (voices.length) {
+      formatter = new Formatter();
+      voices.forEach((v) => formatter!.joinVoices([v]));
+      need = Math.max(EMPTY_BAR, formatter.preCalculateMinTotalWidth(voices) * NOTE_SPACE + BAR_PADDING);
+    }
+    built.push({ pending, voices, formatter, need });
+  }
 
+  // 2. Pack bars into systems.
+  const rowPlan = planRows(
+    built.map((b) => b.need),
+    o.width,
+    firstExtra,
+    rowExtra,
+    showNames ? NAME_WIDTH : 0,
+    showNames ? SHORT_NAME_WIDTH : 0,
+  );
+  const sysH = systemHeight(nStaves);
+  const height = TOP_PAD + rowPlan.length * sysH;
+  const renderer = new Renderer(host as HTMLDivElement, Renderer.Backends.SVG);
+  renderer.resize(o.width, height);
+  const ctx = renderer.getContext();
+  ctx.setFillStyle(o.ink);
+  ctx.setStrokeStyle(o.ink);
+  const layout: ScoreLayout = { height, systems: [], measures: [] };
+  const rowOf: number[] = [];
+
+  // Full systems are justified; a short last system keeps the spacing of the others.
+  const fullScales: number[] = [];
+  rowPlan.forEach((bars, row) => {
+    const indent = showNames ? (row === 0 ? NAME_WIDTH : SHORT_NAME_WIDTH) : 0;
+    const extra = row === 0 ? firstExtra : rowExtra;
+    const room = o.width - SIDE_PAD * 2 - indent - extra;
+    const needSum = bars.reduce((a, i) => a + built[i].need, 0);
+    let scale = room / needSum;
+    const isLast = row === rowPlan.length - 1;
+    if (isLast && rowPlan.length > 1) {
+      const typical = fullScales.length ? fullScales.reduce((a, b) => a + b, 0) / fullScales.length : 1;
+      scale = Math.min(scale, Math.max(1, typical));
+    } else if (isLast) {
+      scale = Math.min(scale, 1.8);
+    } else {
+      fullScales.push(scale);
+    }
+    const top = TOP_PAD + row * sysH;
+    layout.systems.push({ top: top + 10, bottom: top + (nStaves - 1) * STAFF_SPACING + 90 });
+
+    let x = SIDE_PAD + indent;
+    bars.forEach((index, col) => {
+      rowOf[index] = row;
+      const isFirstInRow = col === 0;
+      const isFirst = index === 0;
+      const w = built[index].need * scale + (isFirstInRow ? extra : 0);
+      drawBar(index, row, top, x, w, isFirstInRow, isFirst);
+      x += w;
+    });
+  });
+
+  function drawBar(index: number, row: number, top: number, x: number, w: number, isFirstInRow: boolean, isFirst: boolean) {
     const bars = staves.map((s, si) => {
       const stave = new Stave(x, top + si * STAFF_SPACING, w);
       if (isFirstInRow) {
@@ -185,8 +281,7 @@ export function renderScore(host: HTMLElement, staves: StaffInput[], o: RenderOp
           ctx.setFont("Arial", 11, row === 0 ? "bold" : "normal");
           staves.forEach((s, si) => {
             const label = (row === 0 ? s.name : s.shortName) ?? "";
-            const ty = top + si * STAFF_SPACING + 64;
-            ctx.fillText(label, SIDE_PAD, ty);
+            ctx.fillText(label, SIDE_PAD, top + si * STAFF_SPACING + 64);
           });
           ctx.restore();
         }
@@ -196,40 +291,12 @@ export function renderScore(host: HTMLElement, staves: StaffInput[], o: RenderOp
     }
 
     // Notes, formatted jointly so they line up across staves.
-    const voices: Voice[] = [];
-    const pending: Array<{ si: number; voice: Voice; notes: StaveNote[]; items: ScoreItem[] }> = [];
-    staves.forEach((s, si) => {
-      const measure = s.measures[index];
-      if (!measure || measure.items.length === 0) return;
-      const restKey = s.clef === "bass" ? "d/3" : "b/4";
-      const notes = measure.items.map((item) => {
-        const note = new StaveNote({
-          clef: s.clef,
-          keys: [item.kind === "rest" ? restKey : vexKey(item.midi, s.keySignature)],
-          duration: item.duration + (item.kind === "rest" ? "r" : ""),
-          dots: item.dots,
-          align_center: item.measureRest,
-        });
-        if (item.dots) Dot.buildAndAttach([note], { all: true });
-        note.setStyle(s.isSelected?.(item) ? selected : item.live ? live : ink);
-        drawn[si].push({ note, item, row });
-        return note;
-      });
-      const voice = new Voice({ num_beats: num, beat_value: den }).setMode(Voice.Mode.SOFT);
-      voice.addTickables(notes);
-      Accidental.applyAccidentals([voice], s.keySignature);
-      notes.forEach((n) => n.getModifiers().forEach((m) => m.setStyle(n.getStyle() ?? ink)));
-      voices.push(voice);
-      pending.push({ si, voice, notes, items: measure.items });
-    });
-    if (voices.length) {
-      const formatter = new Formatter();
-      voices.forEach((v) => formatter.joinVoices([v]));
-      formatter.format(voices, Math.max(20, bars[0].getNoteEndX() - noteStart - 26));
-      for (const p of pending) {
-        const beams = beamNotes(p.items, p.notes, o.beamGroups);
+    const b = built[index];
+    if (b.formatter && b.voices.length) {
+      b.formatter.format(b.voices, Math.max(20, bars[0].getNoteEndX() - noteStart - 14));
+      for (const p of b.pending) {
         p.voice.draw(ctx, bars[p.si]);
-        beams.forEach((b) => b.setStyle(ink).setContext(ctx).draw());
+        p.beams.forEach((beam) => beam.setStyle(ink).setContext(ctx).draw());
       }
     }
 
@@ -238,15 +305,17 @@ export function renderScore(host: HTMLElement, staves: StaffInput[], o: RenderOp
     const startStep = sample?.items[0]?.start ?? -1;
     const spanSteps = sample ? sample.items.reduce((a, it) => Math.max(a, it.start + it.steps), startStep) - startStep : 0;
     const points: Array<[number, number]> = [];
-    for (const p of pending) {
+    for (const p of b.pending) {
       p.items.forEach((it, k) => {
         if (!it.measureRest) points.push([it.start, p.notes[k].getAbsoluteX()]);
       });
     }
-    points.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+    points.sort((p1, p2) => p1[0] - p2[0] || p1[1] - p2[1]);
     const dedup = points.filter((pt, i) => i === 0 || pt[0] !== points[i - 1][0]);
-    layout.measures.push({ system: row, startStep, endStep: startStep + spanSteps, x0: noteStart, x1: x + w, points: dedup });
+    layout.measures[index] = { system: row, startStep, endStep: startStep + spanSteps, x0: noteStart, x1: x + w, points: dedup };
   }
+
+  const drawn = drawnItems.map((list) => list.map((d) => ({ note: d.note, item: d.item, row: rowOf[d.bar] })));
 
   // Ties can cross barlines, systems and the edges of the excerpt.
   staves.forEach((s, si) => {

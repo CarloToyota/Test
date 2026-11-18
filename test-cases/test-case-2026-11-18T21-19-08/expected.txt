@@ -1,0 +1,5 @@
+G4:q A4:q B4:q C5:q
+D5:q E5:q F♯5:q G5:q
+F♯5:q E5:q D5:q C5:q
+B4:q A4:q G4:h~
+G4:h

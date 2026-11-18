@@ -28,6 +28,9 @@ use super::wav::f32_to_i16;
 /// device supports it.
 pub const CAPTURE_BUFFER_FRAMES: u32 = 1024;
 
+/// Driver-reported discontinuities in the current stream (see `CaptureHandle::xruns`).
+static XRUNS: AtomicU64 = AtomicU64::new(0);
+
 /// About 1.4 s of mono audio at 48 kHz: plenty of slack if the engine thread is descheduled.
 const RING_CAPACITY: usize = 1 << 16;
 
@@ -82,6 +85,12 @@ impl CaptureHandle {
     /// Samples lost because the engine thread fell behind (should stay 0).
     pub fn dropped_samples(&self) -> u64 {
         self.dropped_samples.load(Ordering::Relaxed)
+    }
+
+    /// Buffer discontinuities the audio driver reported. Many Windows drivers flag
+    /// these spuriously; `dropped_samples` is what says whether audio was lost.
+    pub fn xruns(&self) -> u64 {
+        XRUNS.load(Ordering::Relaxed)
     }
 
     /// Stop capturing and return the session's audio.
@@ -268,10 +277,16 @@ fn open_stream(
     let sample_format = supported.sample_format();
 
     let mut config: StreamConfig = supported.config();
+    // On Windows, let WASAPI pick its buffer: a forced small one (often capped at
+    // 10 ms) leaves no slack and produces discontinuities. Timing is unaffected either
+    // way: notes are timestamped by sample count, not by when buffers arrive.
     let fixed = match supported.buffer_size() {
-        SupportedBufferSize::Range { min, max } => Some(CAPTURE_BUFFER_FRAMES.clamp(*min, *max)),
-        SupportedBufferSize::Unknown => None,
+        SupportedBufferSize::Range { min, max } if !cfg!(target_os = "windows") => {
+            Some(CAPTURE_BUFFER_FRAMES.clamp(*min, *max))
+        }
+        _ => None,
     };
+    XRUNS.store(0, Ordering::Relaxed);
     config.buffer_size = fixed.map_or(BufferSize::Default, BufferSize::Fixed);
 
     let build = |config: StreamConfig| -> Result<(cpal::Stream, rtrb::Consumer<f32>), String> {
@@ -344,7 +359,17 @@ where
                     dropped.fetch_add(lost, Ordering::Relaxed);
                 }
             },
-            |err| eprintln!("[band-audio-engine] input stream error: {err}"),
+            |err| {
+                if err.kind() == cpal::ErrorKind::Xrun {
+                    // Count, and log only the first and then every 500th.
+                    let n = XRUNS.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n == 1 || n % 500 == 0 {
+                        eprintln!("[band-audio-engine] audio driver reported {n} buffer discontinuities so far");
+                    }
+                } else {
+                    eprintln!("[band-audio-engine] input stream error: {err}");
+                }
+            },
             None,
         )
         .map_err(|e| format!("failed to open input stream: {e}"))

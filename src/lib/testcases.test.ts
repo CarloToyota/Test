@@ -3,8 +3,9 @@
 //   replayed.json  events from the *current* engine (cargo run --release --example replay)
 //   expected.txt   the correct notation, one bar per line, same format as session.detected
 // With expected.txt present the case must match it; without it the result is printed.
+// WRITE_EXPECTED=1 npm test  writes the current reading as expected.txt (review it first).
 
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { DEMO_INSTRUMENTS } from "./demo";
@@ -20,6 +21,8 @@ const cases = existsSync(ROOT)
 
 interface Session {
   description: string;
+  /** Notate in this meter instead of the one recorded with (e.g. a 3/4 piece recorded with a 4/4 click). */
+  notateAs?: string;
   instrument: string;
   concertKey: string;
   bpm: number;
@@ -41,7 +44,7 @@ export function notateEvents(events: NoteEvent[], s: Session): string[] {
   }
   const last = timed[timed.length - 1];
   if (last && Number.isNaN(last.endMs)) last.endMs = last.startMs + 100;
-  const ts = parseTimeSignature(s.timeSignature);
+  const ts = parseTimeSignature(s.notateAs ?? s.timeSignature);
   const q = quantizeNotes(timed, { bpm: s.bpm, timeSig: ts, resolution: s.resolution ?? "16th" });
   return layoutMeasures(q, 0, ts).map((m) =>
     m.items.map((i) => `${i.kind === "rest" ? "r" : displayName(i.midi, key)}:${i.duration}${i.dots ? "." : ""}${i.tieToNext ? "~" : ""}`).join(" "),
@@ -57,11 +60,15 @@ describe.skipIf(cases.length === 0)("real-world test cases", () => {
       const events = existsSync(replayed) ? (JSON.parse(readFileSync(replayed, "utf8")) as NoteEvent[]) : session.events;
       const bars = notateEvents(events, session);
       const expectedPath = join(dir, "expected.txt");
+      if (process.env.WRITE_EXPECTED) writeFileSync(expectedPath, bars.join("\n") + "\n");
       if (existsSync(expectedPath)) {
         const expected = readFileSync(expectedPath, "utf8").split("\n").map((l) => l.trim()).filter(Boolean);
         expect(bars).toEqual(expected);
       } else {
         console.log(`\n${c.name}: ${session.description}\n` + bars.map((b, i) => `  ${i + 1}| ${b}`).join("\n"));
+      }
+      if (process.env.SHOW_CASES) {
+        console.log(`\n${c.name} (${existsSync(replayed) ? "replayed" : "recorded"} events)\n` + bars.map((b, i) => `  ${i + 1}| ${b}`).join("\n"));
       }
     });
   }

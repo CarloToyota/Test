@@ -38,6 +38,10 @@ pub struct PitchFrame {
     pub midi: f32,
     /// Unbiased McLeod clarity at the chosen period, 0..1.
     pub clarity: f32,
+    /// Energy at f/2 and its odd multiples relative to the harmonics of f, in dB
+    /// (-inf when f/2 is out of range). High values mean the real note is an octave
+    /// lower with a missing fundamental; the note tracker decides per note.
+    pub sub_octave_db: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -61,6 +65,9 @@ pub struct PitchAnalyzer {
     sample_rate: usize,
     power_threshold: f32,
     config: PitchConfig,
+    /// Hann window and scratch for the sub-octave spectral check.
+    hann: Vec<f32>,
+    windowed: Vec<f32>,
 }
 
 /// Unbiased McLeod normalized square difference at integer lag `tau`.
@@ -123,6 +130,10 @@ impl PitchAnalyzer {
             sample_rate: sample_rate as usize,
             power_threshold: mean_square_gate * window as f32,
             config,
+            hann: (0..window)
+                .map(|i| 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / window as f32).cos())
+                .collect(),
+            windowed: vec![0.0; window],
         }
     }
 
@@ -181,12 +192,51 @@ impl PitchAnalyzer {
         if f < self.config.min_hz || f > self.config.max_hz {
             return None;
         }
+        // Evidence for a missing fundamental: some alto and clarinet notes are almost
+        // pure 2nd harmonic, so their period looks like the octave above. A real note an
+        // octave lower still leaves energy at f/2 and its odd multiples; a genuinely
+        // higher note leaves none.
+        let sub_octave_db = if f / 2.0 >= self.config.min_hz && 2.0 * lag <= longest_lag + 1.0 {
+            self.sub_octave_db(samples, f)
+        } else {
+            f32::NEG_INFINITY
+        };
         Some(PitchFrame {
             frequency_hz: f,
             midi: hz_to_midi(f),
             clarity: clarity.min(1.0),
+            sub_octave_db,
         })
     }
+}
+
+impl PitchAnalyzer {
+    /// Energy at f/2, 3f/2, 5f/2 relative to f, 2f, 3f, in dB (Hann window, Goertzel).
+    fn sub_octave_db(&mut self, samples: &[f32], f: f32) -> f32 {
+        for ((w, &x), &h) in self.windowed.iter_mut().zip(samples).zip(&self.hann) {
+            *w = x * h;
+        }
+        let sr = self.sample_rate as f32;
+        let x = &self.windowed;
+        let odd: f32 = [0.5f32, 1.5, 2.5].iter().map(|k| goertzel(x, sr, f * k)).sum();
+        let even: f32 = [1.0f32, 2.0, 3.0].iter().map(|k| goertzel(x, sr, f * k)).sum();
+        10.0 * (odd / even.max(1e-20)).log10()
+    }
+}
+
+/// Power of `x` at `f` Hz (Goertzel).
+fn goertzel(x: &[f32], sr: f32, f: f32) -> f32 {
+    if f >= sr / 2.0 {
+        return 0.0;
+    }
+    let coeff = 2.0 * (std::f32::consts::TAU * f / sr).cos();
+    let (mut s1, mut s2) = (0.0f32, 0.0f32);
+    for &v in x {
+        let s0 = v + coeff * s1 - s2;
+        s2 = s1;
+        s1 = s0;
+    }
+    s1 * s1 + s2 * s2 - coeff * s1 * s2
 }
 
 /// Accepted fundamental range for a concert MIDI range, with a semitone of headroom

@@ -30,7 +30,10 @@ struct AppState {
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct StoppedPayload {
+    /// Samples lost because the engine fell behind (a real gap in the audio).
     dropped_samples: u64,
+    /// Driver-reported discontinuities (often spurious on Windows).
+    xruns: u64,
 }
 
 #[tauri::command]
@@ -82,11 +85,15 @@ fn stop_engine(app: AppHandle, state: State<'_, AppState>) -> Result<(), String>
     let handle = state.capture.lock().map_err(|_| "engine state poisoned")?.take();
     if let Some(h) = handle {
         let dropped_samples = h.dropped_samples();
+        let xruns = h.xruns();
+        if xruns > 0 {
+            eprintln!("[band-audio-engine] take finished: {xruns} driver discontinuities, {dropped_samples} samples dropped");
+        }
         let recording = h.stop();
         if let Ok(mut slot) = state.last_recording.lock() {
             *slot = Some(recording);
         }
-        let _ = app.emit(STOPPED_EVENT, StoppedPayload { dropped_samples });
+        let _ = app.emit(STOPPED_EVENT, StoppedPayload { dropped_samples, xruns });
     }
     Ok(())
 }

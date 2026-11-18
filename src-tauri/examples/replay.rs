@@ -5,7 +5,12 @@
 //! ```
 //! Prints the note events as a JSON array (same shape as the `note-event` payload).
 
-use band_transcriber_lib::audio_engine::{wav::decode_wav, BandEngine, EngineOutput, Instrument};
+use band_transcriber_lib::audio_engine::{wav::decode_wav, BandEngine, EngineConfig, EngineOutput, Instrument};
+
+/// Tuning overrides for experiments: BT_<NAME>=value.
+fn env_f32(name: &str) -> Option<f32> {
+    std::env::var(format!("BT_{name}")).ok()?.parse().ok()
+}
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -18,7 +23,19 @@ fn main() {
     let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
     let (samples, rate) = decode_wav(&bytes).unwrap_or_else(|e| panic!("{path}: {e}"));
 
-    let mut engine = BandEngine::new(rate, instrument);
+    let mut cfg = EngineConfig::default();
+    if let Some(v) = env_f32("K") { cfg.peak_pick_k = v; }
+    if let Some(v) = env_f32("CLARITY") { cfg.min_clarity = v; }
+    if let Some(v) = env_f32("SUB") { cfg.tracker.sub_octave_db = v; }
+    if let Some(v) = env_f32("RISE") { cfg.onset.rise_db = v; }
+    if let Some(v) = env_f32("REARM") { cfg.onset.rearm_db = v; }
+    if let Some(v) = env_f32("TUNING") { cfg.tracker.tuning_adapt = v; }
+    if let Some(v) = env_f32("REFRACTORY") { cfg.onset.refractory_ms = v; }
+    if let Some(v) = env_f32("MIN_NOTE") { cfg.tracker.min_note_ms = v; }
+    if let Some(v) = env_f32("OCTAVE_MS") { cfg.tracker.octave_change_ms = v; }
+    if let Some(v) = env_f32("CHANGE_MS") { cfg.tracker.change_ms = v; }
+    if let Some(v) = env_f32("RELEASE_MS") { cfg.tracker.release_ms = v; }
+    let mut engine = BandEngine::with_config(rate, instrument, cfg);
     let mut out = Vec::new();
     // Feed in device-sized blocks, like the live capture thread does.
     for block in samples.chunks(1024) {
