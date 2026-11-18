@@ -69,15 +69,50 @@ describe("engraving in other meters", () => {
   });
 });
 
-import { beamGroups } from "./render";
+import { groupSteps, metronomePattern, meterName, parseMeter } from "./meter";
 describe("beam groups", () => {
   it("per meter", () => {
-    expect(beamGroups(4, 4)).toEqual([4, 4, 4, 4]);
-    expect(beamGroups(6, 8)).toEqual([6, 6]);
-    expect(beamGroups(12, 8)).toEqual([6, 6, 6, 6]);
-    expect(beamGroups(2, 2)).toEqual([4, 4, 4, 4]);
-    expect(beamGroups(5, 8)).toEqual([6, 4]);
-    expect(beamGroups(7, 8)).toEqual([4, 4, 6]);
-    expect(beamGroups(3, 8)).toEqual([6]);
+    expect(groupSteps(ts("4/4"))).toEqual([4, 4, 4, 4]);
+    expect(groupSteps(ts("6/8"))).toEqual([6, 6]);
+    expect(groupSteps(ts("12/8"))).toEqual([6, 6, 6, 6]);
+    expect(groupSteps(ts("2/2"))).toEqual([4, 4, 4, 4]);
+    expect(groupSteps(ts("5/8"))).toEqual([6, 4]);
+    expect(groupSteps(ts("7/8"))).toEqual([4, 4, 6]);
+    expect(groupSteps(ts("3/8"))).toEqual([6]);
+  });
+});
+
+describe("custom meters", () => {
+  it("parses plain, grouped and additive forms", () => {
+    expect(parseMeter("11/8")).toEqual({ num: 11, den: 8 });
+    expect(parseMeter("7/8 3+2+2")).toEqual({ num: 7, den: 8, groups: [3, 2, 2] });
+    expect(parseMeter("3+3+2/8")).toEqual({ num: 8, den: 8, groups: [3, 3, 2] });
+    expect(parseMeter("7/8 (2+2+3)")).toEqual({ num: 7, den: 8, groups: [2, 2, 3] });
+    expect(parseMeter("7/6")).toBeNull();
+    expect(parseMeter("7/8 3+3")).toBeNull(); // groups must add up
+    expect(parseMeter("0/4")).toBeNull();
+  });
+
+  it("structure follows the grouping", () => {
+    const m = parseMeter("7/8 3+2+2")!;
+    expect(meterName(m)).toBe("7/8 (3+2+2)");
+    expect(groupSteps(m)).toEqual([6, 4, 4]);
+    expect(beatsPerBar(m)).toBe(7);
+    expect(metronomePattern(m)).toEqual([2, 0, 0, 1, 0, 1, 0]);
+    expect(metronomePattern(ts("6/8"))).toEqual([2, 0]);
+    expect(metronomePattern(ts("4/4"))).toEqual([2, 0, 0, 0]);
+    const s16 = parseMeter("5/16")!;
+    expect([measureSteps(s16), beatSteps(s16)]).toEqual([5, 1]);
+  });
+
+  it("rhythms respect the groups: 3+2+2 vs 2+2+3", () => {
+    // A note lasting three eighths from the downbeat.
+    const a = decompose(0, 6, 14, 2, false, groupSteps(parseMeter("7/8 3+2+2")!));
+    const b = decompose(0, 6, 14, 2, false, groupSteps(parseMeter("7/8 2+2+3")!));
+    expect(a.map((p) => p.duration + (p.dots ? "." : ""))).toEqual(["q."]);
+    expect(b.map((p) => p.duration + (p.dots ? "." : ""))).toEqual(["q", "8"]);
+    // A rest filling the 3-group is a dotted quarter rest.
+    const r = decompose(8, 6, 14, 2, true, groupSteps(parseMeter("7/8 2+2+3")!));
+    expect(r.map((p) => p.duration + (p.dots ? "." : ""))).toEqual(["q."]);
   });
 });

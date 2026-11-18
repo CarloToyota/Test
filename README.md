@@ -36,9 +36,15 @@ npm test
 
 ## Using it
 
-1. Pick your instrument, concert key, tempo and time signature, then press **Record**. A one-bar count-in leads you in.
-2. Press **Stop**. The take becomes an editable score.
-3. **Edit** to fix anything. Click a note or rest, or move with ← →.
+**Parts.** A score holds any number of parts (left panel). Select a part to record into it or edit it, and add more with **Add part**. Mute and volume apply to playback.
+
+**Recording.** Pick the part, then **Record**. A one-bar count-in leads you in. Under the score, choose whether the take **replaces the part** or **adds to the end**, and whether to **hear the other parts** while you play (headphones help). **Stop** writes the take into the part; Ctrl+Z undoes a whole take.
+
+**Playback.** **Play** (or Space) plays every part. A line moves across the score and the sounding notes light up. In edit mode, playback starts from the selected note.
+
+**Views.** **Full score**: one staff per part, in score order, each in its own clef and transposed key. **Part**: just the selected part.
+
+**Editing.** **Edit**, then click a note or rest on any staff, or move with ← →.
 
 | Key | Action |
 |---|---|
@@ -47,12 +53,22 @@ npm test
 | . | Dot or un-dot |
 | ↑ ↓ / Ctrl+↑ ↓ | Semitone / octave |
 | Delete, Backspace, 0 | Turn the note into a rest |
-| Ctrl+Z, Ctrl+Shift+Z | Undo, redo |
+| Space | Play / pause |
+| Ctrl+Z, Ctrl+Shift+Z | Undo, redo (any change, including takes, imports and New) |
+| Ctrl+S, Ctrl+O | Save project, open |
 
-   A longer note overwrites what follows it, as in MuseScore. Changing the time signature after a take re-bars it.
-4. **Export**: **PDF** (Letter or A4, vector), **MusicXML** (validated against the MusicXML 4.0 schema; opens in MuseScore, Finale, Sibelius, Dorico, Noteflight) or **MIDI** (concert pitch).
+A longer note overwrites what follows it, as in MuseScore. Changing the time signature re-bars the whole score.
 
-Time signatures: 2/4, 3/4, 4/4, 5/4, 2/2, 3/8, 5/8, 6/8, 7/8, 9/8 and 12/8. Compound meters count and click dotted-quarter beats; 5/8 and 7/8 count eighths and beam 3+2 and 2+2+3.
+**Time signatures.** 2/4, 3/4, 4/4, 5/4, 2/2, 3/8, 5/8, 6/8, 7/8, 9/8, 12/8, or **Custom…**: any count over 2, 4, 8 or 16, with an optional grouping (`11/8`, `7/8 3+2+2`, `3+3+2/8`, `5/4 3+2`). Groupings set beaming, how notes are split, and metronome accents.
+
+**Files** (File menu):
+- **Open**: a Band Transcriber project (`.bandscore`), MusicXML (`.musicxml`, `.xml`, `.mxl`) or MIDI (`.mid`).
+- **Add parts from a file**: brings another file's parts into this score.
+- **Save project**: keeps every part editable for later.
+
+Imported parts are matched to instruments by name, transposition, General MIDI program or range. Each becomes a single line: voice 1, the top note of chords. Tuplets round to the nearest 16th, and the first time signature applies throughout.
+
+**Export.** **PDF** (full score, this part, or score + every part; Letter or A4), **MusicXML** (all parts, validated against the MusicXML 4.0 schema) and **MIDI** (one track per part, concert pitch).
 
 ## Real-world test cases
 
@@ -81,9 +97,12 @@ SPSC ring (no alloc, no locks)            sliding McLeod pitch ─────�
 | `audio_engine/engine.rs` | Pipeline + end-to-end tests on synthetic reed/brass tones |
 | `audio_engine/capture.rs` | cpal capture + engine thread |
 | `src/lib/quantize.ts` | Rhythm interpretation (alignment, hierarchical snapping, durations to the next attack) and layout into bars, rests, dots and ties |
-| `src/lib/meter.ts` | Time signatures and beat structure |
+| `src/lib/meter.ts` | Time signatures (including custom and additive) and beat structure |
 | `src/lib/editor.ts` | The editable score and its operations (pure, for undo/redo) |
-| `src/lib/render.ts` | VexFlow engraving shared by the screen, the editor and PDF export |
+| `src/lib/render.ts` | VexFlow engraving of one or many staves (bars aligned across parts), shared by the screen, editor, playback and PDF |
+| `src/lib/project.ts` | Multi-part project model and the `.bandscore` file format |
+| `src/lib/playback.ts` | Web Audio synth and scheduler behind playback and play-along |
+| `src/lib/import/` | MusicXML/.mxl and MIDI import |
 | `src/lib/export/` | PDF (jsPDF + svg2pdf), MusicXML 4.0, MIDI |
 | `src-tauri/examples/replay.rs` | Replays a WAV through the engine; used for test cases |
 | `src/lib/music.ts` | Written key per instrument, key-aware note spelling |

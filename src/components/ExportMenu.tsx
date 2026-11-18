@@ -3,19 +3,24 @@ import { Download, FileAudio, FileMusic, FileText, Music4, X } from "lucide-reac
 import type { PageSize } from "../lib/export/pdf";
 
 export type ExportKind = "pdf" | "musicxml" | "midi";
+export type PdfScope = "score" | "part" | "parts";
 
 interface Props {
   title: string;
   onTitle: (t: string) => void;
   disabled: boolean;
-  onExport: (kind: ExportKind, pageSize: PageSize) => Promise<string | null>;
+  onExport: (kind: ExportKind, pageSize: PageSize, scope: PdfScope) => Promise<string | null>;
+  /** Name of the selected part, for "This part". */
+  activePartLabel: string;
+  partCount: number;
   /** Present only inside the desktop app, once a take has been recorded. */
   onExportTestCase?: (description: string) => Promise<string | null>;
 }
 
-export function ExportMenu({ title, onTitle, disabled, onExport, onExportTestCase }: Props) {
+export function ExportMenu({ title, onTitle, disabled, onExport, onExportTestCase, activePartLabel, partCount }: Props) {
   const [open, setOpen] = useState(false);
   const [pageSize, setPageSize] = useState<PageSize>("letter");
+  const [scope, setScope] = useState<PdfScope>("score");
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<{ text: string; error: boolean } | null>(null);
   const [description, setDescription] = useState("");
@@ -68,7 +73,7 @@ export function ExportMenu({ title, onTitle, disabled, onExport, onExportTestCas
           </label>
 
           <div className="export-row">
-            <button className="btn" disabled={busy} onClick={() => run("PDF", () => onExport("pdf", pageSize))}>
+            <button className="btn" disabled={busy} onClick={() => run("PDF", () => onExport("pdf", pageSize, partCount > 1 ? scope : "score"))}>
               <FileText size={16} aria-hidden /> PDF
             </button>
             <div className="segmented" role="group" aria-label="Page size">
@@ -79,17 +84,30 @@ export function ExportMenu({ title, onTitle, disabled, onExport, onExportTestCas
               ))}
             </div>
           </div>
+          {partCount > 1 && (
+            <div className="segmented segmented-wrap" role="group" aria-label="What to print">
+              <button className={scope === "score" ? "is-active" : ""} onClick={() => setScope("score")}>
+                Full score
+              </button>
+              <button className={scope === "part" ? "is-active" : ""} onClick={() => setScope("part")} title={activePartLabel}>
+                This part
+              </button>
+              <button className={scope === "parts" ? "is-active" : ""} onClick={() => setScope("parts")}>
+                Score + all parts
+              </button>
+            </div>
+          )}
           <p className="export-note">Printable sheet music, vector quality.</p>
 
-          <button className="btn" disabled={busy} onClick={() => run("MusicXML", () => onExport("musicxml", pageSize))}>
+          <button className="btn" disabled={busy} onClick={() => run("MusicXML", () => onExport("musicxml", pageSize, scope))}>
             <FileMusic size={16} aria-hidden /> MusicXML
           </button>
-          <p className="export-note">Opens in MuseScore, Finale, Sibelius, Dorico and Noteflight for further editing.</p>
+          <p className="export-note">Every part. Opens in MuseScore, Finale, Sibelius, Dorico and Noteflight for further editing.</p>
 
-          <button className="btn" disabled={busy} onClick={() => run("MIDI", () => onExport("midi", pageSize))}>
+          <button className="btn" disabled={busy} onClick={() => run("MIDI", () => onExport("midi", pageSize, scope))}>
             <Music4 size={16} aria-hidden /> MIDI
           </button>
-          <p className="export-note">Concert-pitch playback for a DAW or notation app.</p>
+          <p className="export-note">One track per part, concert pitch, for a DAW or notation app.</p>
 
           {onExportTestCase && (
             <div className="export-testcase">

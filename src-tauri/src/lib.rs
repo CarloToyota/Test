@@ -116,6 +116,33 @@ async fn save_export(
     Ok(Some(path.display().to_string()))
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenedFile {
+    name: String,
+    bytes: Vec<u8>,
+}
+
+/// Show a native Open dialog and return the chosen file's name and contents.
+#[tauri::command]
+async fn open_file(
+    app: AppHandle,
+    filter_name: String,
+    extensions: Vec<String>,
+) -> Result<Option<OpenedFile>, String> {
+    let exts: Vec<&str> = extensions.iter().map(String::as_str).collect();
+    let Some(path) = app.dialog().file().add_filter(&filter_name, &exts).blocking_pick_file() else {
+        return Ok(None);
+    };
+    let path = path.into_path().map_err(|e| e.to_string())?;
+    let bytes = std::fs::read(&path).map_err(|e| format!("could not read {}: {e}", path.display()))?;
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    Ok(Some(OpenedFile { name, bytes }))
+}
+
 /// Save the last session as a test case: `<folder>/<name>/recording.wav` + `session.json`.
 #[tauri::command]
 async fn export_test_case(
@@ -171,6 +198,7 @@ pub fn run() {
             stop_engine,
             set_instrument,
             save_export,
+            open_file,
             export_test_case
         ])
         .on_window_event(|window, event| {

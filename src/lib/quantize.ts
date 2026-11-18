@@ -1,7 +1,7 @@
 // Rhythm: interpreting timed notes as notated rhythm, then laying that rhythm out in
 // measures of notated durations (rests, dots, ties). Positions are in 16th-note steps.
 
-import { beatSteps, gridLevels, measureSteps, type TimeSignature } from "./meter";
+import { beatSteps, gridLevels, groupSteps, measureSteps, type TimeSignature } from "./meter";
 import type { Resolution } from "./types";
 
 export interface TimedNote {
@@ -188,9 +188,26 @@ export function valueForSteps(steps: number) {
 
 /** Whether a value of `v` steps may start at `p` (steps into the bar) without hiding
  *  the beat, following common engraving practice for each kind of meter. */
-function allowedAt(v: number, p: number, spm: number, beat: number): boolean {
+function allowedAt(v: number, p: number, spm: number, beat: number, groups: number[]): boolean {
   if (p + v > spm) return false;
   if (v === spm) return p === 0;
+  if (beat <= 3) {
+    // Eighth- or 16th-based meters (3/8, 5/8, 7/8, custom groupings): a value either
+    // fits inside one group or spans whole groups from a group boundary.
+    let start = 0;
+    for (const g of groups) {
+      const end = start + g;
+      if (p >= start && p < end) {
+        if (p + v <= end) return true;
+        break;
+      }
+      start = end;
+    }
+    const bounds = new Set<number>([0]);
+    let acc = 0;
+    for (const g of groups) bounds.add((acc += g));
+    return bounds.has(p) && bounds.has(p + v);
+  }
   const beats = spm / beat;
   // In 4/4 and 12/8, a note that starts mid-bar doesn't cross the middle of the bar.
   const mid = beats % 2 === 0 && beats >= 4 ? spm / 2 : -1;
@@ -210,9 +227,6 @@ function allowedAt(v: number, p: number, spm: number, beat: number): boolean {
       if (v === 3) return p % 4 === 0;
       if (v === 2) return p % 2 === 0 || p % 4 === 1;
       return true;
-    case 2: // 3/8, 5/8, 7/8 counted in eighths
-      if (v >= 3) return p % 2 === 0;
-      return true;
     default: // simple quarter-note meters
       if (v === 16) return p === 0;
       if (v === 12) return p % 4 === 0;
@@ -228,16 +242,33 @@ function allowedAt(v: number, p: number, spm: number, beat: number): boolean {
  *  span that starts and ends on beats is written in beat units (q~q, not q.~8). Rests
  *  are only dotted where that is the convention (a dotted-quarter beat in compound
  *  meter). */
-export function decompose(pos: number, len: number, spm: number, beat: number, isRest = false) {
+export function decompose(
+  pos: number,
+  len: number,
+  spm: number,
+  beat: number,
+  isRest = false,
+  groups: number[] = Array(Math.max(1, Math.round(spm / beat))).fill(beat),
+) {
   const pieces: Array<{ steps: number; duration: VexDuration; dots: 0 | 1 }> = [];
+  const fillsGroup = (at: number, v: number) => {
+    let start = 0;
+    for (const g of groups) {
+      if (start === at && g === v) return true;
+      start += g;
+    }
+    return false;
+  };
   let p = pos;
   let remaining = len;
   while (remaining > 0) {
     const grain = p % beat === 0 && remaining % beat === 0 ? beat : p % 2 === 0 && remaining % 2 === 0 ? 2 : 1;
-    const restOk = (v: { steps: number; dots: number }) => !(isRest && v.dots && !(beat === 6 && v.steps === 6));
+    // Dotted rests only where they fill a whole dotted beat or group (6/8 beat, a 3 in 2+2+3).
+    const restOk = (v: { steps: number; dots: number }) =>
+      !(isRest && v.dots) || (beat === 6 && v.steps === 6) || fillsGroup(p, v.steps);
     const v =
-      STEP_VALUES.find((v) => v.steps <= remaining && v.steps % grain === 0 && restOk(v) && allowedAt(v.steps, p, spm, beat)) ??
-      STEP_VALUES.find((v) => v.steps <= remaining && restOk(v) && allowedAt(v.steps, p, spm, beat)) ??
+      STEP_VALUES.find((v) => v.steps <= remaining && v.steps % grain === 0 && restOk(v) && allowedAt(v.steps, p, spm, beat, groups)) ??
+      STEP_VALUES.find((v) => v.steps <= remaining && restOk(v) && allowedAt(v.steps, p, spm, beat, groups)) ??
       STEP_VALUES.find((v) => v.steps <= remaining && restOk(v)) ??
       STEP_VALUES[STEP_VALUES.length - 1];
     pieces.push(v);
@@ -251,6 +282,7 @@ export function decompose(pos: number, len: number, spm: number, beat: number, i
 export function layoutMeasures(q: QNote[], endStep: number, ts: TimeSignature): ScoreMeasure[] {
   const spm = measureSteps(ts);
   const beat = beatSteps(ts);
+  const groups = groupSteps(ts);
   const last = Math.max(endStep, q.length ? q[q.length - 1].e : 0);
   const measureCount = Math.max(1, Math.ceil(last / spm));
 
@@ -271,7 +303,7 @@ export function layoutMeasures(q: QNote[], endStep: number, ts: TimeSignature): 
 
     const pushRest = (from: number, to: number) => {
       let at = from;
-      for (const p of decompose(from - ms, to - from, spm, beat, true)) {
+      for (const p of decompose(from - ms, to - from, spm, beat, true, groups)) {
         items.push(restItem(at, p.steps, p.duration, p.dots));
         at += p.steps;
       }
@@ -284,7 +316,7 @@ export function layoutMeasures(q: QNote[], endStep: number, ts: TimeSignature): 
       const e = Math.min(n.e, me);
       if (e <= s) continue;
       if (s > cursor) pushRest(cursor, s);
-      const pieces = decompose(s - ms, e - s, spm, beat);
+      const pieces = decompose(s - ms, e - s, spm, beat, false, groups);
       let at = s;
       pieces.forEach((p, k) => {
         items.push({

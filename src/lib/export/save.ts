@@ -35,3 +35,27 @@ export function fileStem(title: string): string {
   const s = title.trim().replace(/[^\p{L}\p{N} _-]+/gu, "").replace(/\s+/g, " ");
   return s || "Transcription";
 }
+
+export interface OpenedFile {
+  name: string;
+  bytes: Uint8Array;
+}
+
+/** Ask for a file to open. Returns null if the person cancelled. */
+export async function openFile(filterName: string, extensions: string[]): Promise<OpenedFile | null> {
+  if (isTauri()) {
+    const r = await invoke<{ name: string; bytes: number[] } | null>("open_file", { filterName, extensions });
+    return r ? { name: r.name, bytes: new Uint8Array(r.bytes) } : null;
+  }
+  return new Promise((resolve) => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = extensions.map((e) => `.${e}`).join(",");
+    input.onchange = async () => {
+      const f = input.files?.[0];
+      resolve(f ? { name: f.name, bytes: new Uint8Array(await f.arrayBuffer()) } : null);
+    };
+    input.oncancel = () => resolve(null);
+    input.click();
+  });
+}
