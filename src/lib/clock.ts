@@ -30,6 +30,11 @@ export class EngineClock {
     this.lastUpdatePerf = receivedPerf;
   }
 
+  /** performance.now() time -> engine time (inverse of toPerf). */
+  toEngine(perfMs: number): number {
+    return this.synced ? perfMs - this.offset : perfMs;
+  }
+
   toPerf(engineMs: number): number {
     return this.synced ? engineMs + this.offset : performance.now();
   }

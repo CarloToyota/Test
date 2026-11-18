@@ -65,7 +65,5 @@ export interface InputDevice {
   isDefault: boolean;
 }
 
-export type BeatsPerMeasure = 3 | 4;
-
-/** Quantization resolution in 16th-note steps: 1 = 16th, 2 = 8th, 4 = quarter. */
-export type Resolution = 1 | 2 | 4;
+/** Finest rhythmic value notes snap to: a 16th, an 8th, or the beat itself. */
+export type Resolution = "16th" | "8th" | "beat";

@@ -1,0 +1,13 @@
+{
+  "format": "band-transcriber-test-case",
+  "version": 1,
+  "description": "Synthetic: 8 staccato quarters on concert Eb4 (written C5 for alto), 100 bpm, 4/4, notes sound 220 ms. Generated, not a real horn.",
+  "instrument": "altoSax",
+  "concertKey": "Eb",
+  "bpm": 100,
+  "timeSignature": "4/4",
+  "resolution": "16th",
+  "latencyMs": 0,
+  "gridOriginEngineMs": 500,
+  "events": []
+}

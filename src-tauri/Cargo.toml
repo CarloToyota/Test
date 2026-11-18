@@ -28,6 +28,7 @@ tokio = { version = "1.48", features = ["sync"] }
 pitch-detection = "0.3.0"
 cpal = { version = "0.18.2", optional = true }
 rtrb = { version = "0.4.1", optional = true }
+tauri-plugin-dialog = "2.4"
 
 [profile.dev.package."*"]
 # The DSP must run at full speed even in `tauri dev`, or it falls behind real time.

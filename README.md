@@ -34,6 +34,30 @@ cd src-tauri && cargo test --lib
 npm test
 ```
 
+## Using it
+
+1. Pick your instrument, concert key, tempo and time signature, then press **Record**. A one-bar count-in leads you in.
+2. Press **Stop**. The take becomes an editable score.
+3. **Edit** to fix anything. Click a note or rest, or move with ← →.
+
+| Key | Action |
+|---|---|
+| A–G | Set the selected note's pitch (nearest octave), or write a note into a selected rest |
+| 3 4 5 6 7 | 16th, 8th, quarter, half, whole (also sets the length for new notes) |
+| . | Dot or un-dot |
+| ↑ ↓ / Ctrl+↑ ↓ | Semitone / octave |
+| Delete, Backspace, 0 | Turn the note into a rest |
+| Ctrl+Z, Ctrl+Shift+Z | Undo, redo |
+
+   A longer note overwrites what follows it, as in MuseScore. Changing the time signature after a take re-bars it.
+4. **Export**: **PDF** (Letter or A4, vector), **MusicXML** (validated against the MusicXML 4.0 schema; opens in MuseScore, Finale, Sibelius, Dorico, Noteflight) or **MIDI** (concert pitch).
+
+Time signatures: 2/4, 3/4, 4/4, 5/4, 2/2, 3/8, 5/8, 6/8, 7/8, 9/8 and 12/8. Compound meters count and click dotted-quarter beats; 5/8 and 7/8 count eighths and beam 3+2 and 2+2+3.
+
+## Real-world test cases
+
+**Export → Save test case** writes the take's exact audio plus settings and detections. Put the folder in `test-cases/` and see `test-cases/README.md`: the replay tool re-runs the current engine on the audio, and `npm test` checks the notation against `expected.txt`.
+
 ## Architecture
 
 ```
@@ -56,9 +80,13 @@ SPSC ring (no alloc, no locks)            sliding McLeod pitch ─────�
 | `audio_engine/instrument.rs` | Transposition, clef, range, and per-instrument band and window |
 | `audio_engine/engine.rs` | Pipeline + end-to-end tests on synthetic reed/brass tones |
 | `audio_engine/capture.rs` | cpal capture + engine thread |
-| `src/lib/quantize.ts` | Grid snapping, articulation-gap handling, measures, rests, ties |
+| `src/lib/quantize.ts` | Rhythm interpretation (alignment, hierarchical snapping, durations to the next attack) and layout into bars, rests, dots and ties |
+| `src/lib/meter.ts` | Time signatures and beat structure |
+| `src/lib/editor.ts` | The editable score and its operations (pure, for undo/redo) |
+| `src/lib/render.ts` | VexFlow engraving shared by the screen, the editor and PDF export |
+| `src/lib/export/` | PDF (jsPDF + svg2pdf), MusicXML 4.0, MIDI |
+| `src-tauri/examples/replay.rs` | Replays a WAV through the engine; used for test cases |
 | `src/lib/music.ts` | Written key per instrument, key-aware note spelling |
-| `src/components/SheetMusic.tsx` | VexFlow renderer (beams, ties across barlines and systems, accidentals) |
 
 ## DSP notes
 

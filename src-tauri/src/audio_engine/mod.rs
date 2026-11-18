@@ -20,6 +20,7 @@ pub mod onset;
 pub mod pitch;
 pub mod tracker;
 pub mod types;
+pub mod wav;
 
 #[cfg(feature = "capture")]
 pub mod capture;

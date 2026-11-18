@@ -1,21 +1,21 @@
 import { describe, expect, it } from "vitest";
-import { buildScore, decompose, quantizeNotes } from "./quantize";
+import { buildScore, decompose, quantizeNotes, type QuantizeOptions } from "./quantize";
 
-const opts = { bpm: 120, beatsPerMeasure: 4 as const, resolution: 1 as const };
+const opts: QuantizeOptions = { bpm: 120, timeSig: { num: 4, den: 4 }, resolution: "16th" };
 // At 120 bpm: beat = 500 ms, 16th = 125 ms, bar = 2000 ms.
 const n = (midi: number, startMs: number, endMs: number) => ({ midi, startMs, endMs, live: false });
 
 describe("decompose", () => {
   it("uses single values on the beat", () => {
-    expect(decompose(0, 4, 16).map((p) => p.duration)).toEqual(["q"]);
-    expect(decompose(0, 16, 16).map((p) => p.duration)).toEqual(["w"]);
-    expect(decompose(0, 6, 16).map((p) => [p.duration, p.dots])).toEqual([["q", 1]]);
+    expect(decompose(0, 4, 16, 4).map((p) => p.duration)).toEqual(["q"]);
+    expect(decompose(0, 16, 16, 4).map((p) => p.duration)).toEqual(["w"]);
+    expect(decompose(0, 6, 16, 4).map((p) => [p.duration, p.dots])).toEqual([["q", 1]]);
   });
   it("does not start a half note on beat 2 in 4/4", () => {
-    expect(decompose(4, 8, 16).map((p) => p.duration)).toEqual(["q", "q"]);
+    expect(decompose(4, 8, 16, 4).map((p) => p.duration)).toEqual(["q", "q"]);
   });
   it("allows a half note on beat 2 in 3/4", () => {
-    expect(decompose(4, 8, 12).map((p) => p.duration)).toEqual(["h"]);
+    expect(decompose(4, 8, 12, 4).map((p) => p.duration)).toEqual(["h"]);
   });
 });
 
@@ -38,7 +38,7 @@ describe("quantizeNotes", () => {
     expect(q.map((x) => [x.s, x.e])).toEqual([[0, 4], [8, 12]]);
   });
   it("snaps to a coarser grid", () => {
-    const q = quantizeNotes([n(60, 260, 740)], { ...opts, resolution: 2 });
+    const q = quantizeNotes([n(60, 260, 740)], { ...opts, resolution: "8th" });
     expect(q.map((x) => [x.s, x.e])).toEqual([[2, 6]]);
   });
 });
@@ -73,7 +73,7 @@ describe("buildScore", () => {
 
   it("handles 3/4", () => {
     const notes = [n(60, 0, 1500)];
-    const [bar] = buildScore(notes, 1500, { ...opts, beatsPerMeasure: 3 });
+    const [bar] = buildScore(notes, 1500, { ...opts, timeSig: { num: 3, den: 4 } });
     expect(bar.items.map((i) => [i.duration, i.dots])).toEqual([["h", 1]]);
   });
 });

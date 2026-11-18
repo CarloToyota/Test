@@ -21,6 +21,7 @@ use serde::Serialize;
 use super::engine::BandEngine;
 use super::instrument::Instrument;
 use super::types::EngineOutput;
+use super::wav::f32_to_i16;
 
 /// Requested hardware buffer, in frames. 1024 at 48 kHz is 21 ms. The analysis hop is
 /// independent of this, so a smaller value (256 or 512) lowers latency further if the
@@ -55,12 +56,22 @@ enum Command {
     SetInstrument(Instrument),
 }
 
+/// Longest stretch of a session kept for "Export test case" (16-bit mono: ~58 MB at 48 kHz).
+pub const MAX_RECORDING_SECONDS: usize = 600;
+
+/// The audio of a finished session, exactly as the engine heard it (mono, unfiltered).
+pub struct Recording {
+    pub samples: Vec<i16>,
+    pub sample_rate: u32,
+}
+
 /// A running capture. Dropping it stops the stream and joins the engine thread.
 pub struct CaptureHandle {
     stop: Arc<AtomicBool>,
     commands: mpsc::Sender<Command>,
     dropped_samples: Arc<AtomicU64>,
-    thread: Option<JoinHandle<()>>,
+    sample_rate: u32,
+    thread: Option<JoinHandle<Vec<i16>>>,
 }
 
 impl CaptureHandle {
@@ -73,21 +84,26 @@ impl CaptureHandle {
         self.dropped_samples.load(Ordering::Relaxed)
     }
 
-    pub fn stop(mut self) {
-        self.shutdown();
+    /// Stop capturing and return the session's audio.
+    pub fn stop(mut self) -> Recording {
+        Recording {
+            samples: self.shutdown(),
+            sample_rate: self.sample_rate,
+        }
     }
 
-    fn shutdown(&mut self) {
+    fn shutdown(&mut self) -> Vec<i16> {
         self.stop.store(true, Ordering::Release);
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
-        }
+        self.thread
+            .take()
+            .and_then(|t| t.join().ok())
+            .unwrap_or_default()
     }
 }
 
 impl Drop for CaptureHandle {
     fn drop(&mut self) {
-        self.shutdown();
+        let _ = self.shutdown();
     }
 }
 
@@ -162,13 +178,15 @@ where
                     Ok(v) => v,
                     Err(e) => {
                         let _ = ready_tx.send(Err(e));
-                        return;
+                        return Vec::new();
                     }
                 };
             if let Err(e) = stream.play() {
                 let _ = ready_tx.send(Err(format!("failed to start input stream: {e}")));
-                return;
+                return Vec::new();
             }
+            let max_recording = MAX_RECORDING_SECONDS * info.sample_rate as usize;
+            let mut recording: Vec<i16> = Vec::with_capacity(info.sample_rate as usize * 60);
             let _ = ready_tx.send(Ok(info));
 
             let mut scratch = vec![0.0f32; 4096];
@@ -194,7 +212,10 @@ where
                     scratch[..a.len()].copy_from_slice(a);
                     scratch[a.len()..a.len() + b.len()].copy_from_slice(b);
                     chunk.commit_all();
-                    engine.process(&scratch[..available], &mut out);
+                    let block = &scratch[..available];
+                    engine.process(block, &mut out);
+                    let room = max_recording.saturating_sub(recording.len());
+                    recording.extend(block.iter().take(room).map(|&x| f32_to_i16(x)));
                 }
                 for o in out.drain(..) {
                     sink(o);
@@ -205,6 +226,7 @@ where
                 sink(o);
             }
             drop(stream);
+            recording
         })
         .map_err(|e| format!("failed to spawn audio thread: {e}"))?;
 
@@ -213,14 +235,18 @@ where
         .map_err(|_| "audio device did not respond".to_string())
         .and_then(|r| r);
 
-    let handle = CaptureHandle {
+    let mut handle = CaptureHandle {
         stop,
         commands: cmd_tx,
         dropped_samples: dropped,
+        sample_rate: 0,
         thread: Some(thread),
     };
     match info {
-        Ok(info) => Ok((handle, info)),
+        Ok(info) => {
+            handle.sample_rate = info.sample_rate;
+            Ok((handle, info))
+        }
         Err(e) => {
             drop(handle);
             Err(e)

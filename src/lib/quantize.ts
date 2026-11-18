@@ -1,15 +1,23 @@
-// Turns timed notes into measures of notated durations (with rests and ties).
-// Internally everything is counted in 16th-note steps.
+// Rhythm: interpreting timed notes as notated rhythm, then laying that rhythm out in
+// measures of notated durations (rests, dots, ties). Positions are in 16th-note steps.
 
-import type { BeatsPerMeasure, Resolution } from "./types";
+import { beatSteps, gridLevels, measureSteps, type TimeSignature } from "./meter";
+import type { Resolution } from "./types";
 
 export interface TimedNote {
-  /** Written MIDI pitch. */
   midi: number;
   /** Milliseconds from the grid origin (downbeat of bar 1). */
   startMs: number;
   endMs: number;
   /** Still sounding: rendered with the live highlight. */
+  live: boolean;
+}
+
+/** A note placed on the grid: steps [s, e). */
+export interface QNote {
+  midi: number;
+  s: number;
+  e: number;
   live: boolean;
 }
 
@@ -20,8 +28,14 @@ export interface ScoreItem {
   midi: number;
   duration: VexDuration;
   dots: 0 | 1;
-  /** Tie this item to the next note item (across barlines too). */
+  /** Absolute position and length of this item, in steps. */
+  start: number;
+  steps: number;
+  /** Index of the note in the laid-out note list, or -1 for a rest. */
+  noteIndex: number;
+  /** Tied to the next / from the previous piece of the same note. */
   tieToNext: boolean;
+  tieFromPrev: boolean;
   live: boolean;
   /** Whole-measure rest: drawn centred, whatever the meter. */
   measureRest: boolean;
@@ -34,80 +48,21 @@ export interface ScoreMeasure {
 
 export interface QuantizeOptions {
   bpm: number;
-  beatsPerMeasure: BeatsPerMeasure;
+  timeSig: TimeSignature;
   resolution: Resolution;
 }
 
 /** Notes shorter than this (ms) are treated as glitches and dropped. */
 const MIN_NOTE_MS = 30;
 
-const STEP_VALUES: Array<{ steps: number; duration: VexDuration; dots: 0 | 1 }> = [
-  { steps: 16, duration: "w", dots: 0 },
-  { steps: 12, duration: "h", dots: 1 },
-  { steps: 8, duration: "h", dots: 0 },
-  { steps: 6, duration: "q", dots: 1 },
-  { steps: 4, duration: "q", dots: 0 },
-  { steps: 3, duration: "8", dots: 1 },
-  { steps: 2, duration: "8", dots: 0 },
-  { steps: 1, duration: "16", dots: 0 },
-];
-
-/** Whether a value of `steps` may start at `pos` (steps into the measure) without
- *  hiding the beat, following common engraving practice. */
-function allowedAt(steps: number, pos: number, stepsPerMeasure: number): boolean {
-  switch (steps) {
-    case 16:
-      return pos === 0 && stepsPerMeasure >= 16;
-    case 12:
-      return pos % 4 === 0;
-    case 8:
-      // Half notes on beats 1 or 3 in 4/4; on any beat in 3/4.
-      return stepsPerMeasure === 12 ? pos % 4 === 0 : pos % 8 === 0;
-    case 6:
-    case 4:
-      return pos % 2 === 0;
-    case 3:
-      return pos % 4 === 0;
-    case 2:
-      return pos % 2 === 0 || pos % 4 === 1;
-    default:
-      return true;
-  }
+/** Finest snapping level in steps for a resolution setting. */
+export function resolutionSteps(res: Resolution, ts: TimeSignature): number {
+  return res === "16th" ? 1 : res === "8th" ? 2 : beatSteps(ts);
 }
 
-/** Split `len` steps starting at `pos` into notatable values. A span that starts and
- *  ends on beats is written in beat-multiples (q~q, not q.~8), and rests are never
- *  dotted. */
-export function decompose(pos: number, len: number, stepsPerMeasure: number, isRest = false) {
-  const pieces: Array<{ steps: number; duration: VexDuration; dots: 0 | 1 }> = [];
-  let p = pos;
-  let remaining = len;
-  while (remaining > 0) {
-    const grain = p % 4 === 0 && remaining % 4 === 0 ? 4 : p % 2 === 0 && remaining % 2 === 0 ? 2 : 1;
-    const v =
-      STEP_VALUES.find(
-        (v) =>
-          v.steps <= remaining &&
-          v.steps % grain === 0 &&
-          !(isRest && v.dots) &&
-          allowedAt(v.steps, p, stepsPerMeasure),
-      ) ?? STEP_VALUES[STEP_VALUES.length - 1];
-    pieces.push(v);
-    p += v.steps;
-    remaining -= v.steps;
-  }
-  return pieces;
-}
-
-interface QNote {
-  midi: number;
-  s: number;
-  e: number;
-  live: boolean;
-}
-
-export function stepMs(bpm: number): number {
-  return 60000 / bpm / 4;
+/** Milliseconds per 16th step. */
+export function stepMs(bpm: number, ts: TimeSignature): number {
+  return 60000 / bpm / beatSteps(ts);
 }
 
 // ---- Rhythm interpretation -------------------------------------------------------
@@ -119,43 +74,46 @@ export function stepMs(bpm: number): number {
 // 1. Timing alignment. A steady early or late lean (audio latency, rushing, dragging)
 //    is measured against the 8th-note grid over nearby notes and removed first.
 // 2. Hierarchical snapping. An onset snaps to the beat if close enough, else to the
-//    nearest 8th, and only then to the nearest 16th, so slightly late quarters never
-//    become 16th-note syncopations.
+//    next level down (8th, or quarter in cut time), and only then to the 16th, so
+//    slightly late quarters never become 16th-note syncopations.
 // 3. Durations run to the next attack. A note shorter than a beat is written up to the
 //    next beat (or the next note, if sooner); a rest appears only for real silence.
 
-/** Onsets within this many beats of a beat snap to it. */
+/** Snap tolerance for the beat level, as a fraction of the beat. */
 const BEAT_SNAP = 0.18;
-/** Onsets within this many beats of an 8th position snap to it. */
-const EIGHTH_SNAP = 0.12;
-/** Largest steady timing offset the alignment corrects, in beats. */
-const MAX_ALIGN = 0.2;
+/** Snap tolerance for subdivision levels, as a fraction of the level. */
+const SUB_SNAP = 0.24;
+/** Largest steady timing offset the alignment corrects, in steps. */
+const MAX_ALIGN = 0.8;
 /** Neighbouring onsets on each side used to estimate the local offset. */
 const ALIGN_WINDOW = 6;
 
-/** Snap a position in beats to the simplest metric position near it; returns 16th steps. */
-export function snapBeats(beats: number, resolution: Resolution): number {
-  const beat = Math.round(beats);
-  if (resolution === 4 || Math.abs(beats - beat) <= BEAT_SNAP) return beat * 4;
-  const eighth = Math.round(beats * 2) / 2;
-  if (resolution === 2 || Math.abs(beats - eighth) <= EIGHTH_SNAP) return eighth * 4;
-  return Math.round(beats * 4);
+/** Snap a position (steps) to the simplest metric level that explains it. */
+export function snapSteps(t: number, levels: number[]): number {
+  for (let i = 0; i < levels.length - 1; i++) {
+    const l = levels[i];
+    const nearest = Math.round(t / l) * l;
+    const tol = i === 0 && l >= 4 ? BEAT_SNAP * l : SUB_SNAP * l;
+    if (Math.abs(t - nearest) <= tol) return nearest;
+  }
+  const f = levels[levels.length - 1];
+  return Math.round(t / f) * f;
 }
 
-/** The steady offset (in beats) of these onsets from the 8th-note grid. Robust: notes
+/** The steady offset (in steps) of these onsets from the 8th-note grid. Robust: notes
  *  far off the 8th grid (real 16ths, swing) add a capped constant cost, and a small
  *  penalty keeps it at 0 unless the evidence is consistent. */
-export function estimateOffset(onsetBeats: number[]): number {
-  if (onsetBeats.length < 3) return 0;
-  const steps = 40;
+export function estimateOffset(onsetSteps: number[]): number {
+  if (onsetSteps.length < 3) return 0;
+  const n = 40;
   let best = 0;
   let bestCost = Number.POSITIVE_INFINITY;
-  for (let k = -steps; k <= steps; k++) {
-    const d = (k / steps) * MAX_ALIGN;
-    let cost = onsetBeats.length * 0.02 * Math.abs(d);
-    for (const t of onsetBeats) {
-      const x = (t - d) * 2;
-      cost += Math.min(Math.abs(x - Math.round(x)) / 2, 0.125);
+  for (let k = -n; k <= n; k++) {
+    const d = (k / n) * MAX_ALIGN;
+    let cost = onsetSteps.length * 0.02 * Math.abs(d);
+    for (const t of onsetSteps) {
+      const x = (t - d) / 2;
+      cost += Math.min(Math.abs(x - Math.round(x)) * 2, 0.5);
     }
     if (cost < bestCost - 1e-9) {
       bestCost = cost;
@@ -165,34 +123,37 @@ export function estimateOffset(onsetBeats: number[]): number {
   return best;
 }
 
-/** Interpret timed notes as notated rhythm in 16th steps (the engine is monophonic). */
+/** Interpret timed notes as notated rhythm (the engine is monophonic). */
 export function quantizeNotes(notes: TimedNote[], opts: QuantizeOptions): QNote[] {
-  const res = opts.resolution;
-  const beatMs = 60000 / opts.bpm;
+  const ts = opts.timeSig;
+  const beat = beatSteps(ts);
+  const finest = resolutionSteps(opts.resolution, ts);
+  const levels = gridLevels(ts, finest);
+  const step = stepMs(opts.bpm, ts);
   const sorted = notes
     .filter((n) => n.live || n.endMs - n.startMs >= MIN_NOTE_MS)
     .sort((a, b) => a.startMs - b.startMs);
-  const onsets = sorted.map((n) => n.startMs / beatMs);
+  const onsets = sorted.map((n) => n.startMs / step);
   const offsets = onsets.map((_, i) =>
     estimateOffset(onsets.slice(Math.max(0, i - ALIGN_WINDOW), i + ALIGN_WINDOW + 1)),
   );
-  const starts = onsets.map((t, i) => snapBeats(t - offsets[i], res));
+  const starts = onsets.map((t, i) => snapSteps(t - offsets[i], levels));
 
   const q: QNote[] = [];
   sorted.forEach((n, i) => {
     let s = starts[i];
-    const endBeats = n.endMs / beatMs - offsets[i];
+    const end = n.endMs / step - offsets[i];
     let e: number;
     if (n.live) {
-      e = Math.round((endBeats * 4) / res) * res;
+      e = Math.round(end / finest) * finest;
     } else {
       const next = i + 1 < starts.length ? starts[i + 1] : Number.POSITIVE_INFINITY;
-      const sounded = Math.max(snapBeats(endBeats, res), s + res);
+      const sounded = Math.max(snapSteps(end, levels), s + finest);
       // Shorter than a beat: articulation, so hold it to the next beat or next attack.
-      const written = sounded - s < 4 ? Math.ceil(sounded / 4) * 4 : sounded;
+      const written = sounded - s < beat ? Math.ceil(sounded / beat) * beat : sounded;
       e = Math.min(written, next);
     }
-    if (e <= s) e = s + res;
+    if (e <= s) e = s + finest;
     if (e <= 0) return;
     s = Math.max(0, s);
     const prev = q[q.length - 1];
@@ -207,27 +168,112 @@ export function quantizeNotes(notes: TimedNote[], opts: QuantizeOptions): QNote[
   return q;
 }
 
-/** Build measures from notes, covering the timeline up to `nowMs`. */
-export function buildScore(notes: TimedNote[], nowMs: number, opts: QuantizeOptions): ScoreMeasure[] {
-  const q = quantizeNotes(notes, opts);
-  const spm = opts.beatsPerMeasure * 4;
-  const nowStep = Math.max(0, Math.floor(nowMs / stepMs(opts.bpm)));
-  const endStep = Math.max(nowStep, q.length ? q[q.length - 1].e : 0);
-  const measureCount = Math.max(1, Math.ceil(endStep / spm));
+// ---- Engraving: steps -> notated durations -----------------------------------------
+
+const STEP_VALUES: Array<{ steps: number; duration: VexDuration; dots: 0 | 1 }> = [
+  { steps: 16, duration: "w", dots: 0 },
+  { steps: 12, duration: "h", dots: 1 },
+  { steps: 8, duration: "h", dots: 0 },
+  { steps: 6, duration: "q", dots: 1 },
+  { steps: 4, duration: "q", dots: 0 },
+  { steps: 3, duration: "8", dots: 1 },
+  { steps: 2, duration: "8", dots: 0 },
+  { steps: 1, duration: "16", dots: 0 },
+];
+
+/** Notated value for an exact length in steps, if a single one exists. */
+export function valueForSteps(steps: number) {
+  return STEP_VALUES.find((v) => v.steps === steps) ?? null;
+}
+
+/** Whether a value of `v` steps may start at `p` (steps into the bar) without hiding
+ *  the beat, following common engraving practice for each kind of meter. */
+function allowedAt(v: number, p: number, spm: number, beat: number): boolean {
+  if (p + v > spm) return false;
+  if (v === spm) return p === 0;
+  const beats = spm / beat;
+  // In 4/4 and 12/8, a note that starts mid-bar doesn't cross the middle of the bar.
+  const mid = beats % 2 === 0 && beats >= 4 ? spm / 2 : -1;
+  if (mid > 0 && p < mid && p + v > mid && p !== 0) return false;
+
+  switch (beat) {
+    case 6: // compound: 6/8, 9/8, 12/8
+      if (v === 16 || v === 8) return false;
+      if (v === 12 || v === 6 || v === 3) return p % 6 === 0;
+      if (v === 4) return p % 6 === 0 || p % 6 === 2;
+      if (v === 2) return p % 2 === 0;
+      return true;
+    case 8: // cut time
+      if (v === 16) return p === 0;
+      if (v === 12 || v === 8) return p % 8 === 0;
+      if (v === 6 || v === 4) return p % 2 === 0;
+      if (v === 3) return p % 4 === 0;
+      if (v === 2) return p % 2 === 0 || p % 4 === 1;
+      return true;
+    case 2: // 3/8, 5/8, 7/8 counted in eighths
+      if (v >= 3) return p % 2 === 0;
+      return true;
+    default: // simple quarter-note meters
+      if (v === 16) return p === 0;
+      if (v === 12) return p % 4 === 0;
+      if (v === 8) return beats % 2 === 0 ? p % 8 === 0 : p % 4 === 0;
+      if (v === 6 || v === 4) return p % 2 === 0;
+      if (v === 3) return p % 4 === 0;
+      if (v === 2) return p % 2 === 0 || p % 4 === 1;
+      return true;
+  }
+}
+
+/** Split `len` steps starting at `pos` (steps into the bar) into notatable values. A
+ *  span that starts and ends on beats is written in beat units (q~q, not q.~8). Rests
+ *  are only dotted where that is the convention (a dotted-quarter beat in compound
+ *  meter). */
+export function decompose(pos: number, len: number, spm: number, beat: number, isRest = false) {
+  const pieces: Array<{ steps: number; duration: VexDuration; dots: 0 | 1 }> = [];
+  let p = pos;
+  let remaining = len;
+  while (remaining > 0) {
+    const grain = p % beat === 0 && remaining % beat === 0 ? beat : p % 2 === 0 && remaining % 2 === 0 ? 2 : 1;
+    const restOk = (v: { steps: number; dots: number }) => !(isRest && v.dots && !(beat === 6 && v.steps === 6));
+    const v =
+      STEP_VALUES.find((v) => v.steps <= remaining && v.steps % grain === 0 && restOk(v) && allowedAt(v.steps, p, spm, beat)) ??
+      STEP_VALUES.find((v) => v.steps <= remaining && restOk(v) && allowedAt(v.steps, p, spm, beat)) ??
+      STEP_VALUES.find((v) => v.steps <= remaining && restOk(v)) ??
+      STEP_VALUES[STEP_VALUES.length - 1];
+    pieces.push(v);
+    p += v.steps;
+    remaining -= v.steps;
+  }
+  return pieces;
+}
+
+/** Lay notes out in measures up to `endStep`. Rests fill the gaps. */
+export function layoutMeasures(q: QNote[], endStep: number, ts: TimeSignature): ScoreMeasure[] {
+  const spm = measureSteps(ts);
+  const beat = beatSteps(ts);
+  const last = Math.max(endStep, q.length ? q[q.length - 1].e : 0);
+  const measureCount = Math.max(1, Math.ceil(last / spm));
+
+  const restItem = (start: number, steps: number, duration: VexDuration, dots: 0 | 1, measureRest = false): ScoreItem => ({
+    kind: "rest", midi: 0, duration, dots, start, steps, noteIndex: -1,
+    tieToNext: false, tieFromPrev: false, live: false, measureRest,
+  });
 
   const measures: ScoreMeasure[] = [];
   let ni = 0;
   for (let m = 0; m < measureCount; m++) {
     const ms = m * spm;
     const me = ms + spm;
-    const complete = endStep >= me;
-    const visibleEnd = Math.min(me, endStep);
+    const complete = last >= me;
+    const visibleEnd = Math.min(me, last);
     const items: ScoreItem[] = [];
     let cursor = ms;
 
     const pushRest = (from: number, to: number) => {
-      for (const p of decompose(from - ms, to - from, spm, true)) {
-        items.push({ kind: "rest", midi: 0, duration: p.duration, dots: p.dots, tieToNext: false, live: false, measureRest: false });
+      let at = from;
+      for (const p of decompose(from - ms, to - from, spm, beat, true)) {
+        items.push(restItem(at, p.steps, p.duration, p.dots));
+        at += p.steps;
       }
     };
 
@@ -236,34 +282,44 @@ export function buildScore(notes: TimedNote[], nowMs: number, opts: QuantizeOpti
       const n = q[j];
       const s = Math.max(n.s, ms);
       const e = Math.min(n.e, me);
+      if (e <= s) continue;
       if (s > cursor) pushRest(cursor, s);
-      const pieces = decompose(s - ms, e - s, spm);
+      const pieces = decompose(s - ms, e - s, spm, beat);
+      let at = s;
       pieces.forEach((p, k) => {
-        const last = k === pieces.length - 1;
         items.push({
           kind: "note",
           midi: n.midi,
           duration: p.duration,
           dots: p.dots,
-          tieToNext: !last || n.e > me,
+          start: at,
+          steps: p.steps,
+          noteIndex: j,
+          tieToNext: k < pieces.length - 1 || n.e > me,
+          tieFromPrev: k > 0 || n.s < ms,
           live: n.live,
           measureRest: false,
         });
+        at += p.steps;
       });
       cursor = e;
     }
     if (cursor < visibleEnd) pushRest(cursor, visibleEnd);
 
     if (complete && items.every((i) => i.kind === "rest")) {
-      measures.push({
-        complete,
-        items: [{ kind: "rest", midi: 0, duration: "w", dots: 0, tieToNext: false, live: false, measureRest: true }],
-      });
+      measures.push({ complete, items: [restItem(ms, spm, "w", 0, true)] });
     } else {
       measures.push({ complete, items });
     }
   }
   return measures;
+}
+
+/** Live view: interpret and lay out, covering the timeline up to `nowMs`. */
+export function buildScore(notes: TimedNote[], nowMs: number, opts: QuantizeOptions): ScoreMeasure[] {
+  const q = quantizeNotes(notes, opts);
+  const nowStep = Math.max(0, Math.floor(nowMs / stepMs(opts.bpm, opts.timeSig)));
+  return layoutMeasures(q, nowStep, opts.timeSig);
 }
 
 /** A cheap fingerprint so the renderer only redraws when the notation changes. */

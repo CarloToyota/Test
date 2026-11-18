@@ -10,7 +10,9 @@ use std::sync::Mutex;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use audio_engine::capture::{self, CaptureHandle, CaptureInfo, InputDevice};
+use tauri_plugin_dialog::DialogExt;
+
+use audio_engine::capture::{self, CaptureHandle, CaptureInfo, InputDevice, Recording};
 use audio_engine::instrument::ALL_INSTRUMENTS;
 use audio_engine::{EngineOutput, Instrument, InstrumentInfo};
 
@@ -21,6 +23,8 @@ pub const STOPPED_EVENT: &str = "engine-stopped";
 #[derive(Default)]
 struct AppState {
     capture: Mutex<Option<CaptureHandle>>,
+    /// Audio of the last finished session, for "Export test case".
+    last_recording: Mutex<Option<Recording>>,
 }
 
 #[derive(Serialize, Clone)]
@@ -78,10 +82,73 @@ fn stop_engine(app: AppHandle, state: State<'_, AppState>) -> Result<(), String>
     let handle = state.capture.lock().map_err(|_| "engine state poisoned")?.take();
     if let Some(h) = handle {
         let dropped_samples = h.dropped_samples();
-        h.stop();
+        let recording = h.stop();
+        if let Ok(mut slot) = state.last_recording.lock() {
+            *slot = Some(recording);
+        }
         let _ = app.emit(STOPPED_EVENT, StoppedPayload { dropped_samples });
     }
     Ok(())
+}
+
+/// Show a native Save dialog and write `contents` there. Returns the path, or `None`
+/// if the person cancelled. Async so the blocking dialog never runs on the main thread.
+#[tauri::command]
+async fn save_export(
+    app: AppHandle,
+    default_name: String,
+    filter_name: String,
+    extensions: Vec<String>,
+    contents: Vec<u8>,
+) -> Result<Option<String>, String> {
+    let exts: Vec<&str> = extensions.iter().map(String::as_str).collect();
+    let Some(path) = app
+        .dialog()
+        .file()
+        .set_file_name(&default_name)
+        .add_filter(&filter_name, &exts)
+        .blocking_save_file()
+    else {
+        return Ok(None);
+    };
+    let path = path.into_path().map_err(|e| e.to_string())?;
+    std::fs::write(&path, contents).map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    Ok(Some(path.display().to_string()))
+}
+
+/// Save the last session as a test case: `<folder>/<name>/recording.wav` + `session.json`.
+#[tauri::command]
+async fn export_test_case(
+    app: AppHandle,
+    folder_name: String,
+    session_json: String,
+) -> Result<Option<String>, String> {
+    let wav = {
+        let state = app.state::<AppState>();
+        let slot = state.last_recording.lock().map_err(|_| "recording state poisoned")?;
+        let rec = slot.as_ref().ok_or("No recording yet: record a take first.")?;
+        if rec.samples.is_empty() {
+            return Err("The last take has no audio.".into());
+        }
+        audio_engine::wav::encode_wav_i16(&rec.samples, rec.sample_rate)
+    };
+    let Some(parent) = app
+        .dialog()
+        .file()
+        .set_title("Choose where to save the test case")
+        .blocking_pick_folder()
+    else {
+        return Ok(None);
+    };
+    let safe: String = folder_name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect();
+    let dir = parent.into_path().map_err(|e| e.to_string())?.join(safe);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    std::fs::write(dir.join("recording.wav"), wav).map_err(|e| e.to_string())?;
+    std::fs::write(dir.join("session.json"), session_json).map_err(|e| e.to_string())?;
+    Ok(Some(dir.display().to_string()))
 }
 
 #[tauri::command]
@@ -95,13 +162,16 @@ fn set_instrument(state: State<'_, AppState>, instrument: Instrument) -> Result<
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             get_instruments,
             list_input_devices,
             start_engine,
             stop_engine,
-            set_instrument
+            set_instrument,
+            save_export,
+            export_test_case
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {

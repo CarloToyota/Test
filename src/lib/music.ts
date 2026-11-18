@@ -1,7 +1,7 @@
 // Key signatures, transposition of keys, and note spelling for VexFlow.
 
-const LETTERS = ["C", "D", "E", "F", "G", "A", "B"] as const;
-type Letter = (typeof LETTERS)[number];
+export const LETTERS = ["C", "D", "E", "F", "G", "A", "B"] as const;
+export type Letter = (typeof LETTERS)[number];
 const NATURAL_PC: Record<Letter, number> = { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 };
 const MAJOR_STEPS = [0, 2, 4, 5, 7, 9, 11];
 
@@ -29,7 +29,7 @@ export function writtenKey(concertKey: KeyName, transposeSemitones: number): Key
   return KEY_FOR_PC[pc];
 }
 
-interface Spelled {
+export interface Spelled {
   letter: Letter;
   alter: number; // -2..2
 }
@@ -98,4 +98,35 @@ export function displayName(midi: number, key: KeyName): string {
 
 export function displayKey(key: KeyName): string {
   return key.replace("b", "♭").replace("#", "♯");
+}
+
+/** Spelling of a MIDI pitch in a key: letter, alteration and octave. */
+export function spell(midi: number, key: KeyName): Spelled & { octave: number } {
+  const s = spellPc(((midi % 12) + 12) % 12, key);
+  return { ...s, octave: octaveOf(midi, s) };
+}
+
+/** Sharps (positive) or flats (negative) in a major key signature. */
+export function keyFifths(key: KeyName): number {
+  const order = ["Cb", "Gb", "Db", "Ab", "Eb", "Bb", "F", "C", "G", "D", "A", "E", "B", "F#", "C#"];
+  return order.indexOf(key) - 7;
+}
+
+/** Alteration the key signature gives a letter (e.g. F in D major -> +1). */
+export function keyAlter(letter: Letter, key: KeyName): number {
+  return scaleOf(key).find((s) => s.letter === letter)?.alter ?? 0;
+}
+
+/** The pitch of `letter` (as the key signature alters it) nearest to `near`. */
+export function letterNear(letter: Letter, key: KeyName, near: number): number {
+  const pc = (NATURAL_PC[letter] + keyAlter(letter, key) + 12) % 12;
+  let best = near;
+  let bestDist = Number.POSITIVE_INFINITY;
+  for (let m = near - 6; m <= near + 6; m++) {
+    if (((m % 12) + 12) % 12 === pc && Math.abs(m - near) < bestDist) {
+      best = m;
+      bestDist = Math.abs(m - near);
+    }
+  }
+  return best;
 }
